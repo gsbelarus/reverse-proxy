@@ -39,6 +39,14 @@ const hosts = {
     host: 'localhost',
     port: 3001
   },
+  'chatgpt-proxy.gdmn.app': {
+    host: 'localhost',
+    port: 3002
+  },
+  'whisper-proxy.gdmn.app': {
+    host: 'localhost',
+    port: 8000
+  },
 };
 
 const app = (req, res) => {
@@ -47,7 +55,7 @@ const app = (req, res) => {
     res.write(getLog());
     res.end();
   } else {
-    const redirectTo = hosts[req.headers?.host];
+    const redirectTo = hosts[ req.headers?.host ];
 
     if (redirectTo) {
       log(`${req.headers.host}${req.url}`);
