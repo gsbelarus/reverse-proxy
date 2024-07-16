@@ -2,6 +2,7 @@ const http = require('http');
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
+const { createSecureContext } = require('tls');
 
 const logData = [];
 const maxLogLength = 100;
@@ -19,20 +20,54 @@ const log = (data) => {
 
 const getLog = () => logData.reverse().join('\n\n');
 
-const cert = fs.readFileSync(path.resolve(process.cwd(), 'ssl/gdmn.app.crt'));
-const key = fs.readFileSync(path.resolve(process.cwd(), 'ssl/gdmn.app.key'));
+const loadCert = (domain) => {
+  const cert = fs.readFileSync(path.resolve(process.cwd(), path.join('ssl', domain, `${domain}.crt`)), { encoding: 'utf8' });
+  const key = fs.readFileSync(path.resolve(process.cwd(), path.join('ssl', domain, `${domain}.key`)), { encoding: 'utf8' });
 
-const ca = fs
-  .readFileSync(path.resolve(process.cwd(), 'ssl/gdmn.app.ca-bundle'), { encoding: 'utf8' })
-  .split('-----END CERTIFICATE-----\r\n')
-  .filter((cert) => cert.trim() !== '')
-  .map((cert) => cert + '-----END CERTIFICATE-----\r\n');
+  const ca = fs
+    .readFileSync(path.resolve(process.cwd(), path.join('ssl', domain, `${domain}.ca-bundle`)), { encoding: 'utf8' })
+    .split('-----END CERTIFICATE-----\n')
+    .filter((cert) => cert.trim() !== '')
+    .map((cert) => cert + '-----END CERTIFICATE-----\n');
 
-if (!ca) {
-  throw new Error('No CA file or file is invalid');
-} else {
-  log(`CA file is valid. Number of certificates: ${ca.length}...`);
-}
+  if (!ca) {
+    throw new Error('No CA file or file is invalid');
+  } else {
+    log(`CA file for ${domain} is valid. Number of certificates: ${ca.length}...`);
+  }
+
+  return { key, cert, ca };
+};
+
+const getSecCtx = (domain) => {
+  const { key, cert, ca } = loadCert(domain);
+  return createSecureContext({ key, cert: cert + ca });
+};
+
+const secCtx = {
+  'gdmn.app': getSecCtx('gdmn.app'),
+  'alemaro.team': getSecCtx('alemaro.team')
+};
+
+const sslOptions = {
+  SNICallback: (servername, cb) => {
+    let ctx;
+
+    if (servername.endsWith('gdmn.app')) {
+      ctx = secCtx[ 'gdmn.app' ];
+    }
+    else if (servername.endsWith('alemaro.team')) {
+      ctx = secCtx[ 'alemaro.team' ];
+    }
+    else {
+      log(`No matching SSL certificate for ${servername}`);
+      cb(new Error('No matching SSL certificate'), null);
+      return;
+    }
+
+    cb(null, ctx);
+  }
+};
 
 const hosts = {
   'coder-ai.gdmn.app': {
@@ -46,6 +81,10 @@ const hosts = {
   'whisper-proxy.gdmn.app': {
     host: 'localhost',
     port: 8000
+  },
+  'alemaro.team': {
+    host: 'localhost',
+    port: 3003
   },
 };
 
@@ -83,7 +122,9 @@ const app = (req, res) => {
   }
 };
 
+const options = sslOptions; //loadCert('gdmn.app');
+
 https
-  .createServer({ cert, ca, key }, app)
+  .createServer(options, app)
   .listen(443, () => log(`>>> HTTPS server is running at https://localhost`));
 
