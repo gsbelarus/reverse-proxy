@@ -128,3 +128,15 @@ https
   .createServer(options, app)
   .listen(443, () => log(`>>> HTTPS server is running at https://localhost`));
 
+
+// Define the HTTP server
+http
+  .createServer((req, res) => {
+    // Construct the HTTPS URL
+    const httpsUrl = `https://${req.headers.host}${req.url}`;
+
+    // Send a 301 Moved Permanently response with the HTTPS URL
+    res.writeHead(301, { Location: httpsUrl });
+    res.end();
+  })
+  .listen(80, () => log(`>>> HTTP server is listening on port 80 and redirecting all traffic to HTTPS`));  
