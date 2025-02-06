@@ -6,6 +6,8 @@ const { createSecureContext } = require('tls');
 
 const logData = [];
 const maxLogLength = 100;
+let parralelRequests = 0;
+let maxParallelRequests = 0;
 
 const log = (data) => {
   if (typeof data !== 'string') {
@@ -23,7 +25,6 @@ const getLog = () => logData.reverse().join('\n\n');
 const loadCert = (domain) => {
   const cert = fs.readFileSync(path.resolve(process.cwd(), path.join('ssl', domain, `${domain}.crt`)), { encoding: 'utf8' });
   const key = fs.readFileSync(path.resolve(process.cwd(), path.join('ssl', domain, `${domain}.key`)), { encoding: 'utf8' });
-
   const ca = fs
     .readFileSync(path.resolve(process.cwd(), path.join('ssl', domain, `${domain}.ca-bundle`)), { encoding: 'utf8' })
     .split('-----END CERTIFICATE-----\n')
@@ -86,34 +87,61 @@ const hosts = {
     host: 'localhost',
     port: 3003
   },
+  'socket-server.gdmn.app': {
+    host: 'localhost',
+    port: 3030
+  },
+  'webrtc-turns.gdmn.app': {
+    host: 'localhost',
+    port: 5349
+  },
 };
 
 const app = (req, res) => {
   if (req.url === '/_reverse_proxy_log' && req.method === 'GET') {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.write(`Max parallel requests: ${maxParallelRequests}\n\n`);
+    res.write(`Current parallel requests: ${parralelRequests}\n\n`);
     res.write(getLog());
     res.end();
   } else {
-    const redirectTo = hosts[ req.headers?.host ];
+    req.setTimeout(900_000); // 15 minutes
+
+    const redirectTo = hosts[ req.headers?.host ?? '' ];
 
     if (redirectTo) {
-      log(`${req.headers.host}${req.url}`);
+      //log(`${req.headers.host}${req.url}`);
 
-      const http_client = http.request({
-        host: redirectTo.host,
-        port: redirectTo.port,
-        path: req.url,
-        method: req.method,
-        headers: req.headers,
-        body: req.body
-      }, (resp) => {
-        res.writeHead(resp.statusCode, resp.headers);
-        resp.pipe(res);
-      });
+      try {
+        parralelRequests++;
 
-      req.pipe(http_client);
+        if (parralelRequests > maxParallelRequests) {
+          maxParallelRequests = parralelRequests;
+        }
+
+        const http_client = http.request({
+          host: redirectTo.host,
+          port: redirectTo.port,
+          path: req.url,
+          method: req.method,
+          headers: req.headers,
+          body: req.body
+        }, (resp) => {
+          res.writeHead(resp.statusCode, resp.headers);
+          resp.pipe(res);
+          parralelRequests--;
+        });
+
+        req.pipe(http_client);
+      }
+      catch (e) {
+        log(`Error: ${e.message}`);
+        res.writeHead(500, { 'Content-Type': 'text/plain' });
+        res.write('Internal Server Error');
+        res.end();
+      }
     } else {
-      log(`Not found: ${req.headers.host}, ${req.url}`);
+      log(`Not found: ${req.headers?.host}, ${req.url}`);
 
       res.writeHead(404, { 'Content-Type': 'text/plain' });
       res.write('Not Found');
@@ -124,19 +152,29 @@ const app = (req, res) => {
 
 const options = sslOptions; //loadCert('gdmn.app');
 
-https
-  .createServer(options, app)
-  .listen(443, () => log(`>>> HTTPS server is running at https://localhost`));
+const httpsServer = https.createServer(options, app);
+
+httpsServer.requestTimeout = 900_000;
+httpsServer.timeout = 900_000;
+httpsServer.keepAliveTimeout = 900_000;
+httpsServer.headersTimeout = 950_000; // Slightly longer than request timeout
+
+httpsServer.listen(443, () => log(`>>> HTTPS server is running at https://localhost`));
 
 
 // Define the HTTP server
-http
-  .createServer((req, res) => {
-    // Construct the HTTPS URL
-    const httpsUrl = `https://${req.headers.host}${req.url}`;
+const httpServer = http.createServer((req, res) => {
+  // Construct the HTTPS URL
+  const httpsUrl = `https://${req.headers.host}${req.url}`;
 
-    // Send a 301 Moved Permanently response with the HTTPS URL
-    res.writeHead(301, { Location: httpsUrl });
-    res.end();
-  })
-  .listen(80, () => log(`>>> HTTP server is listening on port 80 and redirecting all traffic to HTTPS`));  
+  // Send a 301 Moved Permanently response with the HTTPS URL
+  res.writeHead(301, { Location: httpsUrl });
+  res.end();
+});
+
+httpServer.requestTimeout = 900_000;
+httpServer.timeout = 900_000;
+httpServer.keepAliveTimeout = 900_000;
+httpServer.headersTimeout = 950_000; // Slightly longer than request timeout
+
+httpServer.listen(80, () => log(`>>> HTTP server is listening on port 80 and redirecting all traffic to HTTPS`));  
