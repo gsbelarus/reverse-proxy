@@ -8,6 +8,7 @@ const logData = [];
 const maxLogLength = 100;
 let parralelRequests = 0;
 let maxParallelRequests = 0;
+let totalRequests = 0;
 
 const log = (data) => {
   if (typeof data !== 'string') {
@@ -71,18 +72,18 @@ const sslOptions = {
 };
 
 const hosts = {
-  'coder-ai.gdmn.app': {
-    host: 'localhost',
-    port: 3001
-  },
+  // 'coder-ai.gdmn.app': {
+  //   host: 'localhost',
+  //   port: 3001
+  // },
   'chatgpt-proxy.gdmn.app': {
     host: 'localhost',
     port: 3002
   },
-  'whisper-proxy.gdmn.app': {
-    host: 'localhost',
-    port: 8000
-  },
+  // 'whisper-proxy.gdmn.app': {
+  //   host: 'localhost',
+  //   port: 8000
+  // },
   'alemaro.team': {
     host: 'localhost',
     port: 3003
@@ -102,6 +103,7 @@ const app = (req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
     res.write(`Max parallel requests: ${maxParallelRequests}\n\n`);
     res.write(`Current parallel requests: ${parralelRequests}\n\n`);
+    res.write(`Total requests: ${totalRequests}\n\n`);
     res.write(getLog());
     res.end();
   } else {
@@ -114,6 +116,7 @@ const app = (req, res) => {
 
       try {
         parralelRequests++;
+        totalRequests++;
 
         if (parralelRequests > maxParallelRequests) {
           maxParallelRequests = parralelRequests;
