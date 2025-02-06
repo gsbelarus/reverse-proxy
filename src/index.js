@@ -24,10 +24,19 @@ const log = (data) => {
 const getLog = () => logData.reverse().join('\n\n');
 
 const loadCert = (domain) => {
-  const cert = fs.readFileSync(path.resolve(process.cwd(), path.join('ssl', domain, `${domain}.crt`)), { encoding: 'utf8' });
-  const key = fs.readFileSync(path.resolve(process.cwd(), path.join('ssl', domain, `${domain}.key`)), { encoding: 'utf8' });
+  const cert = fs.readFileSync(
+    path.resolve(process.cwd(), path.join('ssl', domain, `${domain}.crt`)),
+    { encoding: 'utf8' }
+  );
+  const key = fs.readFileSync(
+    path.resolve(process.cwd(), path.join('ssl', domain, `${domain}.key`)),
+    { encoding: 'utf8' }
+  );
   const ca = fs
-    .readFileSync(path.resolve(process.cwd(), path.join('ssl', domain, `${domain}.ca-bundle`)), { encoding: 'utf8' })
+    .readFileSync(
+      path.resolve(process.cwd(), path.join('ssl', domain, `${domain}.ca-bundle`)),
+      { encoding: 'utf8' }
+    )
     .split('-----END CERTIFICATE-----\n')
     .filter((cert) => cert.trim() !== '')
     .map((cert) => cert + '-----END CERTIFICATE-----\n');
@@ -54,19 +63,15 @@ const secCtx = {
 const sslOptions = {
   SNICallback: (servername, cb) => {
     let ctx;
-
     if (servername.endsWith('gdmn.app')) {
       ctx = secCtx[ 'gdmn.app' ];
-    }
-    else if (servername.endsWith('alemaro.team')) {
+    } else if (servername.endsWith('alemaro.team')) {
       ctx = secCtx[ 'alemaro.team' ];
-    }
-    else {
+    } else {
       log(`No matching SSL certificate for ${servername}`);
       cb(new Error('No matching SSL certificate'), null);
       return;
     }
-
     cb(null, ctx);
   }
 };
@@ -95,7 +100,7 @@ const hosts = {
   'webrtc-turns.gdmn.app': {
     host: 'localhost',
     port: 5349
-  },
+  }
 };
 
 const app = (req, res) => {
@@ -110,7 +115,6 @@ const app = (req, res) => {
     req.setTimeout(900_000); // 15 minutes
 
     let host = req.headers?.host ?? '';
-
     if (host.toLowerCase().startsWith('www.')) {
       host = host.slice(4);
     }
@@ -118,40 +122,49 @@ const app = (req, res) => {
     const redirectTo = hosts[ host ];
 
     if (redirectTo) {
-      //log(`${req.headers.host}${req.url}`);
+      parralelRequests++;
+      totalRequests++;
 
-      try {
-        parralelRequests++;
-        totalRequests++;
+      if (parralelRequests > maxParallelRequests) {
+        maxParallelRequests = parralelRequests;
+      }
 
-        if (parralelRequests > maxParallelRequests) {
-          maxParallelRequests = parralelRequests;
-        }
-
-        const http_client = http.request({
+      // Create the HTTP client request for proxying
+      const http_client = http.request(
+        {
           host: redirectTo.host,
           port: redirectTo.port,
           path: req.url,
           method: req.method,
-          headers: req.headers,
-          body: req.body
-        }, (resp) => {
+          headers: req.headers
+        },
+        (resp) => {
           res.writeHead(resp.statusCode, resp.headers);
           resp.pipe(res);
-          parralelRequests--;
-        });
+          resp.on('end', () => {
+            parralelRequests--;
+          });
+        }
+      );
 
-        req.pipe(http_client);
-      }
-      catch (e) {
-        log(`Error: ${e.message}`);
-        res.writeHead(500, { 'Content-Type': 'text/plain' });
-        res.write('Internal Server Error');
-        res.end();
-      }
+      // Handle errors from the proxy request (e.g. ECONNREFUSED)
+      http_client.on('error', (err) => {
+        parralelRequests--;
+        log(`Error proxying request for ${req.headers.host}${req.url}: ${err.message}`);
+        if (!res.headersSent) {
+          res.writeHead(502, { 'Content-Type': 'text/plain' });
+        }
+        res.end('Bad Gateway');
+      });
+
+      // Optionally handle errors on the incoming request stream
+      req.on('error', (err) => {
+        log(`Error on incoming request: ${err.message}`);
+      });
+
+      req.pipe(http_client);
     } else {
-      log(`Not found: ${req.headers?.host}, ${req.url}`);
-
+      //log(`Not found: ${req.headers?.host}, ${req.url}`);
       res.writeHead(404, { 'Content-Type': 'text/plain' });
       res.write('Not Found');
       res.end();
@@ -159,8 +172,7 @@ const app = (req, res) => {
   }
 };
 
-const options = sslOptions; //loadCert('gdmn.app');
-
+const options = sslOptions;
 const httpsServer = https.createServer(options, app);
 
 httpsServer.requestTimeout = 900_000;
@@ -170,13 +182,8 @@ httpsServer.headersTimeout = 950_000; // Slightly longer than request timeout
 
 httpsServer.listen(443, () => log(`>>> HTTPS server is running at https://localhost`));
 
-
-// Define the HTTP server
 const httpServer = http.createServer((req, res) => {
-  // Construct the HTTPS URL
   const httpsUrl = `https://${req.headers.host}${req.url}`;
-
-  // Send a 301 Moved Permanently response with the HTTPS URL
   res.writeHead(301, { Location: httpsUrl });
   res.end();
 });
@@ -186,4 +193,6 @@ httpServer.timeout = 900_000;
 httpServer.keepAliveTimeout = 900_000;
 httpServer.headersTimeout = 950_000; // Slightly longer than request timeout
 
-httpServer.listen(80, () => log(`>>> HTTP server is listening on port 80 and redirecting all traffic to HTTPS`));  
+httpServer.listen(80, () =>
+  log(`>>> HTTP server is listening on port 80 and redirecting all traffic to HTTPS`)
+);
