@@ -109,7 +109,13 @@ const app = (req, res) => {
   } else {
     req.setTimeout(900_000); // 15 minutes
 
-    const redirectTo = hosts[ req.headers?.host ?? '' ];
+    let host = req.headers?.host ?? '';
+
+    if (host.toLowerCase().startsWith('www.')) {
+      host = host.slice(4);
+    }
+
+    const redirectTo = hosts[ host ];
 
     if (redirectTo) {
       //log(`${req.headers.host}${req.url}`);
