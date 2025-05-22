@@ -21,7 +21,7 @@ const log = (data) => {
   console.log(data);
 };
 
-const getLog = () => logData.reverse().join('\n\n');
+const getLog = () => [ ...logData ].reverse().join('\n\n');
 
 const loadCert = (domain) => {
   const cert = fs.readFileSync(
