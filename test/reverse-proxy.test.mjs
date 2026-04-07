@@ -22,6 +22,11 @@ const {
   createRequestTracker,
   createUpgradeProxyHandler
 } = require('../src/reverseProxy.js');
+const {
+  buildCertificateChainPem,
+  loadDomainCertificateFiles,
+  parseCertificateBundle
+} = require('../src/tlsCertificates.js');
 const { createTlsRouterHandler, inspectTlsClientHello } = require('../src/tlsRouter.js');
 
 const TEST_TLS_KEY = fs.readFileSync(
@@ -387,6 +392,73 @@ test('chatgpt-proxy raises downstream socket timeout to the effective budget', (
 
   assert.deepEqual(reqTimeouts, [930_000]);
   assert.deepEqual(resTimeouts, [930_000]);
+});
+
+test('certificate chain assembly concatenates PEM blocks without commas', () => {
+  const leafCertificatePem =
+    '-----BEGIN CERTIFICATE-----\nleaf\n-----END CERTIFICATE-----\n';
+  const bundlePem =
+    '-----BEGIN CERTIFICATE-----\nintermediate-1\n-----END CERTIFICATE-----\n' +
+    '-----BEGIN CERTIFICATE-----\nintermediate-2\n-----END CERTIFICATE-----\n';
+
+  const intermediates = parseCertificateBundle(bundlePem);
+  const certChainPem = buildCertificateChainPem(leafCertificatePem, intermediates);
+
+  assert.equal(intermediates.length, 2);
+  assert.equal(certChainPem.includes(',-----BEGIN CERTIFICATE-----'), false);
+  assert.equal(certChainPem, leafCertificatePem + intermediates.join(''));
+});
+
+test('certificate chain supports Node TLS verification for gdmn.app', async (t) => {
+  const gdmnApp = loadDomainCertificateFiles('gdmn.app');
+
+  const server = https.createServer(
+    {
+      key: gdmnApp.key,
+      cert: gdmnApp.certChainPem
+    },
+    (_req, res) => {
+      res.writeHead(200);
+      res.end('ok');
+    }
+  );
+  const port = await listen(server);
+  t.after(() => closeServer(server));
+
+  const requestDomain = (servername) =>
+    new Promise((resolve, reject) => {
+      const req = https.get(
+        {
+          host: '127.0.0.1',
+          port,
+          servername,
+          path: '/',
+          agent: false,
+          headers: {
+            host: servername
+          }
+        },
+        (res) => {
+          resolve(res.statusCode);
+          res.resume();
+        }
+      );
+
+      req.on('error', reject);
+    });
+
+  assert.equal(await requestDomain('chatgpt-proxy.gdmn.app'), 200);
+});
+
+test('certificate chain context can still be created for alemaro.team', () => {
+  const alemaroTeam = loadDomainCertificateFiles('alemaro.team');
+
+  assert.doesNotThrow(() => {
+    tls.createSecureContext({
+      key: alemaroTeam.key,
+      cert: alemaroTeam.certChainPem
+    });
+  });
 });
 
 test('timeout classification distinguishes proxy timeout from unavailable upstream', () => {

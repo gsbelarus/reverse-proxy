@@ -1,11 +1,10 @@
 const http = require('http');
 const https = require('https');
 const net = require('net');
-const fs = require('fs');
-const path = require('path');
 const { createSecureContext } = require('tls');
 
 const { HOSTS, getRuntimeConfig } = require('./config');
+const { loadDomainCertificateFiles } = require('./tlsCertificates');
 const {
   createLogStore,
   createProxyRequestHandler,
@@ -23,42 +22,18 @@ const passthroughTracker = createRequestTracker({
   maxParallelRequests: config.maxParallelRequests
 });
 
-const loadCert = (domain) => {
-  const cert = fs.readFileSync(
-    path.resolve(process.cwd(), path.join('ssl', domain, `${domain}.crt`)),
-    { encoding: 'utf8' }
-  );
-  const key = fs.readFileSync(
-    path.resolve(process.cwd(), path.join('ssl', domain, `${domain}.key`)),
-    { encoding: 'utf8' }
-  );
-  const ca = fs
-    .readFileSync(
-      path.resolve(process.cwd(), path.join('ssl', domain, `${domain}.ca-bundle`)),
-      { encoding: 'utf8' }
-    )
-    .split('-----END CERTIFICATE-----\n')
-    .filter((certificate) => certificate.trim() !== '')
-    .map((certificate) => `${certificate}-----END CERTIFICATE-----\n`);
-
-  if (ca.length === 0) {
-    throw new Error(`No CA file or CA file is invalid for ${domain}`);
-  }
+const getSecCtx = (domain) => {
+  const { key, certChainPem, intermediates } = loadDomainCertificateFiles(domain);
 
   logStore.append({
     timestamp: new Date().toISOString(),
     type: 'startup',
     event: 'ssl_context_loaded',
     domain,
-    certificateCount: ca.length
+    certificateCount: intermediates.length
   });
 
-  return { key, cert, ca };
-};
-
-const getSecCtx = (domain) => {
-  const { key, cert, ca } = loadCert(domain);
-  return createSecureContext({ key, cert, ca });
+  return createSecureContext({ key, cert: certChainPem });
 };
 
 const secCtx = {
