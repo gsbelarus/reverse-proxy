@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import http from 'node:http';
 import https from 'node:https';
@@ -73,6 +74,79 @@ const closeServer = (server) =>
       resolve();
     });
   });
+
+const captureTlsClientHello = (servername) =>
+  new Promise(async (resolve, reject) => {
+    let capturedChunk = null;
+    const captureServer = net.createServer((socket) => {
+      socket.once('data', (chunk) => {
+        capturedChunk = chunk;
+        socket.destroy();
+      });
+    });
+
+    const capturePort = await listen(captureServer);
+
+    const finish = async (error) => {
+      await closeServer(captureServer);
+
+      if (error) {
+        reject(error);
+        return;
+      }
+
+      resolve(capturedChunk);
+    };
+
+    const client = tls.connect({
+      host: '127.0.0.1',
+      port: capturePort,
+      servername,
+      rejectUnauthorized: false
+    });
+
+    client.on('error', () => finish());
+    client.on('close', () => finish());
+  });
+
+const createMockSocket = (overrides = {}) => {
+  const socket = new EventEmitter();
+
+  return Object.assign(socket, {
+    destroyed: false,
+    writableEnded: false,
+    remoteAddress: '127.0.0.1',
+    remotePort: 0,
+    pause() {
+      return undefined;
+    },
+    resume() {
+      return undefined;
+    },
+    setNoDelay() {
+      return undefined;
+    },
+    setTimeout() {
+      return undefined;
+    },
+    write() {
+      return true;
+    },
+    unshift() {
+      return undefined;
+    },
+    pipe(destination) {
+      return destination;
+    },
+    destroy() {
+      socket.destroyed = true;
+    },
+    end() {
+      socket.writableEnded = true;
+      socket.destroyed = true;
+    }
+  }, overrides);
+};
 
 const createConfig = (overrides = {}) => ({
   inboundTimeoutMs: 500,
@@ -595,34 +669,137 @@ test('upgrade requests are proxied for mapped hosts', async (t) => {
   await waitFor(() => fixture.tracker.snapshot().currentParallelRequests === 0);
 });
 
+test('http requests reject tls-passthrough targets as unsupported', async (t) => {
+  const fixture = createProxyFixture({
+    hosts: {
+      'webrtc-turns.gdmn.app': {
+        host: '127.0.0.1',
+        port: 5349,
+        mode: 'tls-passthrough'
+      }
+    }
+  });
+
+  const proxyPort = await listen(fixture.server);
+  t.after(() => closeServer(fixture.server));
+
+  const response = await requestProxy({
+    port: proxyPort,
+    hostHeader: 'webrtc-turns.gdmn.app',
+    path: '/turn'
+  });
+  const body = JSON.parse(response.body);
+
+  assert.equal(response.statusCode, 502);
+  assert.equal(body.error.type, 'unsupported_target');
+  assert.equal(body.error.code, 'REVERSE_PROXY_UNSUPPORTED_TARGET');
+});
+
+test('upgrade requests reject tls-passthrough targets as unsupported', async (t) => {
+  const fixture = createProxyFixture({
+    hosts: {
+      'webrtc-turns.gdmn.app': {
+        host: '127.0.0.1',
+        port: 5349,
+        mode: 'tls-passthrough'
+      }
+    }
+  });
+
+  const proxyPort = await listen(fixture.server);
+  t.after(() => closeServer(fixture.server));
+
+  const rawResponse = await new Promise((resolve, reject) => {
+    const client = net.connect({ host: '127.0.0.1', port: proxyPort }, () => {
+      client.write(
+        'GET /turn HTTP/1.1\r\nHost: webrtc-turns.gdmn.app\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n'
+      );
+    });
+
+    let data = '';
+    client.setEncoding('utf8');
+    client.on('data', (chunk) => {
+      data += chunk;
+    });
+    client.on('end', () => resolve(data));
+    client.on('error', reject);
+  });
+
+  assert.match(rawResponse, /502 Bad Gateway/);
+  assert.match(rawResponse, /"type": "unsupported_target"/);
+  assert.match(rawResponse, /"code": "REVERSE_PROXY_UNSUPPORTED_TARGET"/);
+});
+
 test('tls client hello inspection extracts the SNI host', async (t) => {
-  let capturedChunk = null;
-  const captureServer = net.createServer((socket) => {
-    socket.once('data', (chunk) => {
-      capturedChunk = chunk;
-      socket.destroy();
-    });
-  });
-  const capturePort = await listen(captureServer);
-  t.after(() => closeServer(captureServer));
-
-  await new Promise((resolve) => {
-    const client = tls.connect({
-      host: '127.0.0.1',
-      port: capturePort,
-      servername: 'webrtc-turns.gdmn.app',
-      rejectUnauthorized: false
-    });
-
-    client.on('error', resolve);
-    client.on('close', resolve);
-  });
+  const capturedChunk = await captureTlsClientHello('webrtc-turns.gdmn.app');
 
   assert.ok(capturedChunk);
   const inspection = inspectTlsClientHello(capturedChunk);
   assert.equal(inspection.state, 'parsed');
   assert.equal(inspection.serverName, 'webrtc-turns.gdmn.app');
 });
+
+test(
+  'tls passthrough clears connect timer when upstream fails before connect',
+  { concurrency: false },
+  async (t) => {
+    const originalClearTimeout = global.clearTimeout;
+    const clearedTimers = [];
+
+    global.clearTimeout = (timer) => {
+      clearedTimers.push(timer);
+      return originalClearTimeout(timer);
+    };
+
+    t.after(() => {
+      global.clearTimeout = originalClearTimeout;
+    });
+
+    const clientHello = await captureTlsClientHello('webrtc-turns.gdmn.app');
+    const config = createConfig({ connectTimeoutMs: 500, upstreamTimeoutMs: 500 });
+    const tracker = createRequestTracker({
+      maxParallelRequests: config.maxParallelRequests
+    });
+    const logStore = createLogStore({ maxEntries: config.logBufferLength });
+    const upstreamSocket = createMockSocket();
+    const downstreamSocket = createMockSocket({ remotePort: 12345 });
+    const handler = createTlsRouterHandler({
+      hosts: {
+        'webrtc-turns.gdmn.app': {
+          host: '127.0.0.1',
+          port: 5349,
+          mode: 'tls-passthrough'
+        }
+      },
+      httpsServer: {
+        emit() {
+          throw new Error('Unexpected HTTPS handoff for passthrough target');
+        }
+      },
+      config,
+      tracker,
+      logStore,
+      socketFactory: () => upstreamSocket
+    });
+
+    handler(downstreamSocket);
+    downstreamSocket.emit('data', clientHello);
+
+    assert.equal(clearedTimers.length, 1);
+
+    upstreamSocket.emit(
+      'error',
+      createProxyError('ECONNREFUSED', 'connect ECONNREFUSED 127.0.0.1:5349', {
+        isUpstream: true
+      })
+    );
+
+    await waitFor(() => logStore.snapshot().entries.length === 1);
+
+    assert.equal(clearedTimers.length, 2);
+    assert.equal(logStore.snapshot().entries[0].resultCategory, 'upstream_failure');
+  }
+);
 
 test('https requests still proxy through the SNI router', async (t) => {
   const upstreamServer = http.createServer((_req, res) => {

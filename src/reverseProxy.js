@@ -433,8 +433,7 @@ const createRequestContext = ({ req, resolution, config, kind }) => ({
   routeHost: resolution.normalizedHost,
   target: resolution.target
     ? {
-      host: resolution.target.host,
-      port: resolution.target.port,
+      ...resolution.target,
       protocol: resolution.target.protocol ?? 'http:'
     }
     : null,

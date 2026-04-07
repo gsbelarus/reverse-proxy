@@ -25,17 +25,6 @@ const once = (fn) => {
   };
 };
 
-const sanitizeError = (error) => {
-  if (!error) {
-    return null;
-  }
-
-  return {
-    code: error.code ?? 'UNKNOWN',
-    message: String(error.message ?? 'Unknown error').slice(0, 512)
-  };
-};
-
 const toTunnelResult = (error) => {
   const classification = classifyProxyError(error);
 
@@ -393,8 +382,14 @@ const createTlsRouterHandler = ({
         bytesReceived: 0,
         bytesSent: 0
       };
+      let connectTimer = null;
 
       const finalize = once((result) => {
+        if (connectTimer) {
+          clearTimeout(connectTimer);
+          connectTimer = null;
+        }
+
         if (lease) {
           lease.release();
         }
@@ -448,7 +443,7 @@ const createTlsRouterHandler = ({
         );
       };
 
-      const connectTimer = setTimeout(() => {
+      connectTimer = setTimeout(() => {
         failTunnel(
           createProxyError(
             'REVERSE_PROXY_CONNECT_TIMEOUT',
@@ -509,6 +504,7 @@ const createTlsRouterHandler = ({
       upstreamSocket.once('connect', () => {
         tunnelEstablished = true;
         clearTimeout(connectTimer);
+        connectTimer = null;
         socket.setTimeout(ctx.timeoutValues.upstreamTimeoutMs, idleTimeoutHandler);
         upstreamSocket.setTimeout(ctx.timeoutValues.upstreamTimeoutMs, idleTimeoutHandler);
         upstreamSocket.write(bufferedData());
