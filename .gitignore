@@ -132,4 +132,5 @@ dist
 *.key
 *.crt
 *.ca-bundle
+acme-data/
 ssl/**/star_gdmn_app.p7b

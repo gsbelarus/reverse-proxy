@@ -7,14 +7,14 @@ WORKDIR /app
 # Copy package.json and package-lock.json to the working directory
 COPY package*.json ./
 
-# Install dependencies
-RUN npm install
+# Install production dependencies
+RUN npm ci --omit=dev
 
-# Copy the rest of the application code to the working directory
-COPY . .
+# Copy only the runtime application code; certificates are mounted at runtime
+COPY src ./src
 
 # Expose the port on which the server will listen
-EXPOSE 443
+EXPOSE 80 443
 
 # Start the server
 CMD [ "node", "src/index.js" ]

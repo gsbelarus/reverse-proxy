@@ -1,16 +1,18 @@
 const http = require('http');
 const https = require('https');
 const net = require('net');
-const { createSecureContext } = require('tls');
 
 const { HOSTS, getRuntimeConfig } = require('./config');
-const { loadDomainCertificateFiles } = require('./tlsCertificates');
+const { createAcmeManager } = require('./acmeManager');
+const { createAcmeChallengeStore } = require('./acmeChallengeStore');
+const { createHttpRedirectHandler } = require('./httpChallenge');
 const {
   createLogStore,
   createProxyRequestHandler,
   createRequestTracker,
   createUpgradeProxyHandler
 } = require('./reverseProxy');
+const { createTlsRegistry } = require('./tlsRegistry');
 const { createTlsRouterHandler, toPassthroughSummary } = require('./tlsRouter');
 
 const config = getRuntimeConfig();
@@ -21,46 +23,44 @@ const tracker = createRequestTracker({
 const passthroughTracker = createRequestTracker({
   maxParallelRequests: config.maxParallelRequests
 });
+const challengeStore = createAcmeChallengeStore();
+const tlsRegistry = createTlsRegistry({
+  baseDir: process.cwd(),
+  hosts: HOSTS,
+  logStore,
+  managedCertificateRoot: config.acme.managedCertificateRoot,
+  manualCertificateRoot: 'ssl'
+});
 
-const getSecCtx = (domain) => {
-  const { key, certChainPem, intermediates } = loadDomainCertificateFiles(domain);
+tlsRegistry.reload();
 
-  logStore.append({
-    timestamp: new Date().toISOString(),
-    type: 'startup',
-    event: 'ssl_context_loaded',
-    domain,
-    certificateCount: intermediates.length
-  });
-
-  return createSecureContext({ key, cert: certChainPem });
-};
-
-const secCtx = {
-  'gdmn.app': getSecCtx('gdmn.app'),
-  'alemaro.team': getSecCtx('alemaro.team')
-};
+const acmeManager = createAcmeManager({
+  baseDir: process.cwd(),
+  challengeStore,
+  config,
+  logStore,
+  tlsRegistry
+});
 
 const sslOptions = {
   SNICallback: (servername, cb) => {
-    let ctx;
+    const certificateResolution = tlsRegistry.lookup(servername);
 
-    if (servername.endsWith('gdmn.app')) {
-      ctx = secCtx['gdmn.app'];
-    } else if (servername.endsWith('alemaro.team')) {
-      ctx = secCtx['alemaro.team'];
-    } else {
+    if (!certificateResolution.context) {
       logStore.append({
         timestamp: new Date().toISOString(),
-        type: 'startup',
+        type: 'tls',
         event: 'ssl_context_missing',
-        servername
+        certificateDomain: certificateResolution.certificateDomain,
+        message: certificateResolution.error?.message ?? null,
+        servername,
+        source: certificateResolution.source
       });
       cb(new Error('No matching SSL certificate'), null);
       return;
     }
 
-    cb(null, ctx);
+    cb(null, certificateResolution.context);
   }
 };
 
@@ -79,7 +79,8 @@ const app = createProxyRequestHandler({
         upstreamTimeoutMs: config.upstreamTimeoutMs,
         connectTimeoutMs: config.connectTimeoutMs
       },
-      tlsPassthroughConnections: toPassthroughSummary(passthroughTracker)
+      tlsPassthroughConnections: toPassthroughSummary(passthroughTracker),
+      tlsCertificates: tlsRegistry.getSnapshot().certificateStates
     };
   }
 });
@@ -121,7 +122,8 @@ logStore.append({
     upstreamTimeoutMs: config.upstreamTimeoutMs,
     connectTimeoutMs: config.connectTimeoutMs
   },
-  maxParallelRequests: config.maxParallelRequests
+  maxParallelRequests: config.maxParallelRequests,
+  acmeEnabled: config.acme.enabled
 });
 
 const tlsRouter = net.createServer(
@@ -134,6 +136,26 @@ const tlsRouter = net.createServer(
   })
 );
 
+let listenersReady = 0;
+const maybeStartAcme = async () => {
+  listenersReady += 1;
+
+  if (listenersReady < 2) {
+    return;
+  }
+
+  try {
+    await acmeManager.start();
+  } catch (error) {
+    logStore.append({
+      timestamp: new Date().toISOString(),
+      type: 'acme',
+      event: 'acme_start_failed',
+      message: error.message
+    });
+  }
+};
+
 tlsRouter.listen(443, () => {
   logStore.append({
     timestamp: new Date().toISOString(),
@@ -144,13 +166,17 @@ tlsRouter.listen(443, () => {
       .filter(([, target]) => target.mode === 'tls-passthrough')
       .map(([host]) => host)
   });
+
+  void maybeStartAcme();
 });
 
-const httpServer = http.createServer((req, res) => {
-  const httpsUrl = `https://${req.headers.host}${req.url}`;
-  res.writeHead(301, { Location: httpsUrl });
-  res.end();
-});
+const httpServer = http.createServer(
+  createHttpRedirectHandler({
+    challengeStore,
+    hosts: HOSTS,
+    logStore
+  })
+);
 
 applyServerTimeouts(httpServer);
 
@@ -161,4 +187,12 @@ httpServer.listen(80, () => {
     event: 'http_redirect_server_listening',
     port: 80
   });
+
+  void maybeStartAcme();
 });
+
+for (const signal of ['SIGINT', 'SIGTERM']) {
+  process.once(signal, () => {
+    acmeManager.stop();
+  });
+}

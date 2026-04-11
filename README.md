@@ -6,10 +6,24 @@ This repository runs a Node.js edge proxy on ports `443` and `80`. Public port `
 
 - Package manager: `npm` via `package-lock.json`
 - Runtime entrypoint: `npm start` or `node src/index.js`
-- Container runtime expectation: `Dockerfile` uses `node:23-alpine`, copies the full repository, runs `npm install`, and starts `node src/index.js`
+- Container runtime expectation: `Dockerfile` uses `node:25-alpine`, copies only runtime files, installs production dependencies, and starts `node src/index.js`
 - Listener expectation: the process binds directly to `80` and `443`
-- TLS expectation: certificates must exist at `ssl/<domain>/<domain>.crt`, `.key`, and `.ca-bundle`
+- TLS expectation: manual certificates can exist at `ssl/<domain>/<domain>.crt`, `.key`, and `.ca-bundle`, and should be mounted at runtime rather than baked into the image
 - Upstream expectation proven by this repo: most routed backends are localhost HTTP services, and `webrtc-turns.gdmn.app` is a raw TLS passthrough route to `localhost:5349`
+
+## TLS Certificate Sources
+
+- Manual certificates under `ssl/<domain>/` remain the first-priority source and continue to work for the matching domain and any subdomain covered by that certificate.
+- Let's Encrypt is used only for TLS-terminated hostnames that do not have manual coverage from `ssl/`.
+- ACME-managed certificates are stored separately under `acme-data/certificates/<domain>/` by default so user-provided files in `ssl/` stay untouched.
+- If a manual certificate later appears for a hostname that was previously using Let's Encrypt, the manual certificate wins on the next registry reload.
+- Hosts configured as `tls-passthrough` are excluded from certificate issuance and renewal.
+
+## Let's Encrypt HTTP-01
+
+- Port `80` still redirects normal traffic to HTTPS.
+- The only exception is `/.well-known/acme-challenge/*`, which is served directly for active HTTP-01 challenges.
+- Automatic issuance and renewal are enabled only when `REVERSE_PROXY_ACME_EMAIL` is set or `REVERSE_PROXY_ACME_ENABLED=true` is configured together with an email address.
 
 ## Host Mappings
 
@@ -39,6 +53,55 @@ The reverse proxy now applies explicit lifecycle controls to proxied HTTP reques
 - `REVERSE_PROXY_MAX_PARALLEL_REQUESTS`: maximum concurrent proxied HTTP requests, upgrade tunnels, or TURN/TLS passthrough tunnels before the relevant path rejects or closes new work. Default: `256`
 - `REVERSE_PROXY_INBOUND_TIMEOUT_MS`: inbound server timeout for client connections. Default: `900000`
 - `REVERSE_PROXY_LOG_BUFFER_LENGTH`: in-memory structured log depth exposed through `/_reverse_proxy_log`. Default: `500`
+- `REVERSE_PROXY_ACME_ENABLED`: explicitly enable or disable automatic Let's Encrypt management. Default: enabled when `REVERSE_PROXY_ACME_EMAIL` is set, otherwise disabled.
+- `REVERSE_PROXY_ACME_EMAIL`: contact email used when creating or reusing the Let's Encrypt ACME account.
+- `REVERSE_PROXY_ACME_TERMS_OF_SERVICE_AGREED`: whether ACME account registration should agree to the CA terms. Default: `true`
+- `REVERSE_PROXY_ACME_DIRECTORY_URL`: ACME directory URL. Default: Let's Encrypt production.
+- `REVERSE_PROXY_ACME_RENEWAL_WINDOW_DAYS`: renew managed certificates this many days before expiry. Default: `30`
+- `REVERSE_PROXY_ACME_RENEW_CHECK_INTERVAL_MS`: interval between renewal checks. Default: `43200000`
+- `REVERSE_PROXY_ACME_MANAGED_CERT_DIR`: base directory for ACME-managed certificates. Default: `acme-data/certificates`
+- `REVERSE_PROXY_ACME_ACCOUNT_KEY_PATH`: file path for the persisted ACME account private key. Default: `acme-data/account.key`
+- `REVERSE_PROXY_ACME_PREFERRED_CHAIN`: optional preferred chain name passed to the ACME client.
+- `REVERSE_PROXY_ACME_SKIP_CHALLENGE_VERIFICATION`: disable the ACME client's internal HTTP-01 pre-verification. Default: `false`
+
+### Example .env
+
+Use Let's Encrypt staging first, then switch `REVERSE_PROXY_ACME_DIRECTORY_URL` to production after the first successful issuance.
+
+```dotenv
+REVERSE_PROXY_ACME_ENABLED=true
+REVERSE_PROXY_ACME_EMAIL=ops@example.com
+REVERSE_PROXY_ACME_TERMS_OF_SERVICE_AGREED=true
+REVERSE_PROXY_ACME_DIRECTORY_URL=https://acme-staging-v02.api.letsencrypt.org/directory
+REVERSE_PROXY_ACME_RENEWAL_WINDOW_DAYS=30
+REVERSE_PROXY_ACME_RENEW_CHECK_INTERVAL_MS=43200000
+REVERSE_PROXY_ACME_MANAGED_CERT_DIR=acme-data/certificates
+REVERSE_PROXY_ACME_ACCOUNT_KEY_PATH=acme-data/account.key
+```
+
+### Docker Run Example
+
+This example keeps manual certificates under `ssl/`, stores Let's Encrypt account and managed certificate data under `acme-data/`, and loads the environment from `.env`.
+
+```bash
+docker run -d \
+	--name reverse-proxy \
+	--restart unless-stopped \
+	-p 80:80 \
+	-p 443:443 \
+	--env-file ./.env \
+	-v /path/to/reverse-proxy/ssl:/app/ssl:ro \
+	-v /path/to/reverse-proxy/acme-data:/app/acme-data \
+	gsbelarus/reverse-proxy
+```
+
+Notes:
+
+- Keep `ssl/` mounted read-only if it contains only user-managed certificates.
+- Keep `acme-data/` writable so the proxy can store the ACME account key and managed certificates.
+- `--env-file ./.env` is read from the host shell's current working directory. Use an absolute path if you want to avoid any ambiguity.
+- The image intentionally does not bundle manual certificate files; provide them through the `ssl/` mount.
+- If you later switch from staging to production, update `REVERSE_PROXY_ACME_DIRECTORY_URL` and remove any staging certificates from `acme-data/` before reissuing.
 
 ## Proxy Failure Semantics
 
@@ -68,6 +131,7 @@ Proxy-generated errors are returned as JSON in this shape:
 - `x-forwarded-for`, `x-forwarded-host`, `x-forwarded-proto`, and `x-request-id` are added explicitly
 - Hop-by-hop headers are stripped from proxied HTTP requests and responses
 - Public HTTPS and websocket traffic still runs through the same in-process HTTPS server after SNI-based TCP demultiplexing, so the HTTP proxy keeps the original client socket and remote address
+- TLS context selection now uses a mixed registry: manual `ssl/` certificates first, then ACME-managed certificates for exact hostnames without manual coverage
 
 ## Upgrade Support
 
@@ -85,5 +149,6 @@ Important constraint: SNI is required to distinguish TURN/TLS traffic from regul
 
 - current, peak, and configured concurrency values
 - timeout configuration
+- TLS certificate source and availability for each TLS-terminated hostname
 - recent sanitized request lifecycle entries with request IDs, routes, upstream targets, duration, outcome, and status details
 - passthrough tunnel concurrency and TLS tunnel lifecycle entries for TURN/TLS traffic

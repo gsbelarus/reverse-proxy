@@ -420,7 +420,7 @@ const resolveTimeouts = (target, routeHost, config) => ({
   upstreamTimeoutMs:
     target?.upstreamTimeoutMs ??
     (routeHost === CHATGPT_PROXY_HOST
-      ? config.chatgptProxyTimeoutMs
+      ? (config.chatgptProxyTimeoutMs ?? config.upstreamTimeoutMs)
       : config.upstreamTimeoutMs)
 });
 

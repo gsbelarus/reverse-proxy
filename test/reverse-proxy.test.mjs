@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import https from 'node:https';
 import net from 'node:net';
+import os from 'node:os';
 import path from 'node:path';
 import tls from 'node:tls';
 import test from 'node:test';
@@ -11,7 +12,10 @@ import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
 
+const { createAcmeChallengeStore } = require('../src/acmeChallengeStore.js');
+const { createAcmeManager } = require('../src/acmeManager.js');
 const { getRuntimeConfig, resolveHostMapping } = require('../src/config.js');
+const { createHttpRedirectHandler } = require('../src/httpChallenge.js');
 const {
   applyDownstreamTimeoutBudget,
   classifyProxyError,
@@ -24,9 +28,12 @@ const {
 } = require('../src/reverseProxy.js');
 const {
   buildCertificateChainPem,
+  hasCompleteCertificateFiles,
   loadDomainCertificateFiles,
-  parseCertificateBundle
+  parseCertificateBundle,
+  writeDomainCertificateFiles
 } = require('../src/tlsCertificates.js');
+const { createTlsRegistry } = require('../src/tlsRegistry.js');
 const { createTlsRouterHandler, inspectTlsClientHello } = require('../src/tlsRouter.js');
 
 const TEST_TLS_KEY = fs.readFileSync(
@@ -312,6 +319,30 @@ const createTlsEdgeFixture = ({ hosts, config = createConfig() }) => {
   };
 };
 
+const createTempDir = () => fs.mkdtempSync(path.join(os.tmpdir(), 'reverse-proxy-'));
+
+const seedCertificateFiles = async ({
+  baseDir,
+  certificateRoot,
+  domain,
+  sourceDomain = domain
+}) => {
+  const certificateFiles = loadDomainCertificateFiles(sourceDomain);
+
+  await writeDomainCertificateFiles(
+    domain,
+    {
+      caBundlePem: certificateFiles.intermediates.join(''),
+      cert: certificateFiles.cert,
+      key: certificateFiles.key
+    },
+    {
+      baseDir,
+      certificateRoot
+    }
+  );
+};
+
 test('host resolution strips www prefix and port', () => {
   const resolution = resolveHostMapping('www.chatgpt-proxy.gdmn.app:443', {
     'chatgpt-proxy.gdmn.app': { host: 'localhost', port: 3002 }
@@ -459,6 +490,282 @@ test('certificate chain context can still be created for alemaro.team', () => {
       cert: alemaroTeam.certChainPem
     });
   });
+});
+
+test('tls registry prefers manual certificate coverage over exact managed certificates', async (t) => {
+  const tempDir = createTempDir();
+  t.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+
+  await seedCertificateFiles({
+    baseDir: tempDir,
+    certificateRoot: 'manual-certs',
+    domain: 'gdmn.app',
+    sourceDomain: 'gdmn.app'
+  });
+  await seedCertificateFiles({
+    baseDir: tempDir,
+    certificateRoot: 'managed-certs',
+    domain: 'chatgpt-proxy.gdmn.app',
+    sourceDomain: 'alemaro.team'
+  });
+
+  const registry = createTlsRegistry({
+    baseDir: tempDir,
+    hosts: {
+      'chatgpt-proxy.gdmn.app': {
+        host: '127.0.0.1',
+        mode: 'http-proxy',
+        port: 3002,
+        protocol: 'http:'
+      },
+      'new.example.com': {
+        host: '127.0.0.1',
+        mode: 'http-proxy',
+        port: 3004,
+        protocol: 'http:'
+      }
+    },
+    managedCertificateRoot: 'managed-certs',
+    manualCertificateRoot: 'manual-certs'
+  });
+
+  registry.reload();
+
+  const certificateResolution = registry.lookup('chatgpt-proxy.gdmn.app');
+
+  assert.equal(certificateResolution.source, 'manual');
+  assert.equal(certificateResolution.certificateDomain, 'gdmn.app');
+  assert.deepEqual(registry.getManagedHostnames(), ['new.example.com']);
+});
+
+test('http challenge handler serves active ACME challenges before redirecting other traffic', async (t) => {
+  const challengeStore = createAcmeChallengeStore();
+  const logStore = createLogStore({ maxEntries: 10 });
+  const hosts = {
+    'api.example.com': {
+      host: '127.0.0.1',
+      port: 3001,
+      protocol: 'http:'
+    }
+  };
+  challengeStore.set({
+    identifier: 'api.example.com',
+    keyAuthorization: 'token-1.authorized',
+    token: 'token-1'
+  });
+
+  const server = http.createServer(
+    createHttpRedirectHandler({
+      challengeStore,
+      hosts,
+      logStore
+    })
+  );
+  const port = await listen(server);
+  t.after(() => closeServer(server));
+
+  const challengeResponse = await requestProxy({
+    hostHeader: 'api.example.com',
+    path: '/.well-known/acme-challenge/token-1',
+    port
+  });
+  const missingChallengeResponse = await requestProxy({
+    hostHeader: 'api.example.com',
+    path: '/.well-known/acme-challenge/missing',
+    port
+  });
+  const redirectResponse = await requestProxy({
+    hostHeader: 'www.api.example.com:80',
+    path: '/health',
+    port
+  });
+
+  assert.equal(challengeResponse.statusCode, 200);
+  assert.equal(challengeResponse.body, 'token-1.authorized');
+  assert.equal(missingChallengeResponse.statusCode, 404);
+  assert.equal(redirectResponse.statusCode, 301);
+  assert.equal(redirectResponse.headers.location, 'https://api.example.com/health');
+});
+
+test('http redirect handler rejects missing Host headers', async (t) => {
+  const server = http.createServer(
+    createHttpRedirectHandler({
+      challengeStore: createAcmeChallengeStore(),
+      hosts: {
+        'api.example.com': {
+          host: '127.0.0.1',
+          port: 3001,
+          protocol: 'http:'
+        }
+      },
+      logStore: createLogStore({ maxEntries: 10 })
+    })
+  );
+  const port = await listen(server);
+  t.after(() => closeServer(server));
+
+  const rawResponse = await new Promise((resolve, reject) => {
+    const client = net.connect({ host: '127.0.0.1', port }, () => {
+      client.write('GET /health HTTP/1.1\r\nConnection: close\r\n\r\n');
+    });
+
+    let data = '';
+    client.setEncoding('utf8');
+    client.on('data', (chunk) => {
+      data += chunk;
+    });
+    client.on('end', () => resolve(data));
+    client.on('error', reject);
+  });
+
+  assert.match(rawResponse, /400 Bad Request/);
+  assert.doesNotMatch(rawResponse, /Location:/i);
+});
+
+test('http redirect handler rejects unknown Host headers instead of redirecting them', async (t) => {
+  const server = http.createServer(
+    createHttpRedirectHandler({
+      challengeStore: createAcmeChallengeStore(),
+      hosts: {
+        'api.example.com': {
+          host: '127.0.0.1',
+          port: 3001,
+          protocol: 'http:'
+        }
+      },
+      logStore: createLogStore({ maxEntries: 10 })
+    })
+  );
+  const port = await listen(server);
+  t.after(() => closeServer(server));
+
+  const response = await requestProxy({
+    hostHeader: 'attacker.example.net',
+    path: '/health',
+    port
+  });
+
+  assert.equal(response.statusCode, 400);
+  assert.equal(response.headers.location, undefined);
+  assert.equal(response.body, 'Bad Request');
+});
+
+test('acme manager provisions only HTTPS hosts without manual certificate coverage', async (t) => {
+  const tempDir = createTempDir();
+  t.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+
+  await seedCertificateFiles({
+    baseDir: tempDir,
+    certificateRoot: 'manual-certs',
+    domain: 'gdmn.app',
+    sourceDomain: 'gdmn.app'
+  });
+
+  const registry = createTlsRegistry({
+    baseDir: tempDir,
+    hosts: {
+      'chatgpt-proxy.gdmn.app': {
+        host: '127.0.0.1',
+        mode: 'http-proxy',
+        port: 3002,
+        protocol: 'http:'
+      },
+      'new.example.com': {
+        host: '127.0.0.1',
+        mode: 'http-proxy',
+        port: 3004,
+        protocol: 'http:'
+      },
+      'webrtc-turns.gdmn.app': {
+        host: '127.0.0.1',
+        mode: 'tls-passthrough',
+        port: 5349
+      }
+    },
+    managedCertificateRoot: 'managed-certs',
+    manualCertificateRoot: 'manual-certs'
+  });
+  const challengeStore = createAcmeChallengeStore();
+  const logStore = createLogStore({ maxEntries: 50 });
+  const requestedDomains = [];
+  const challengeLookups = [];
+  const certificateChainPem = loadDomainCertificateFiles('gdmn.app').certChainPem;
+
+  registry.reload();
+
+  const manager = createAcmeManager({
+    acmeModule: {
+      Client: class {
+        async auto(options) {
+          const domain = requestedDomains[requestedDomains.length - 1];
+
+          await options.challengeCreateFn(
+            { identifier: { value: domain } },
+            { token: 'token-1', type: 'http-01' },
+            'token-1.authorized'
+          );
+          challengeLookups.push(
+            challengeStore.resolveRequest(
+              domain,
+              '/.well-known/acme-challenge/token-1'
+            )?.keyAuthorization ?? null
+          );
+          await options.challengeRemoveFn(
+            { identifier: { value: domain } },
+            { token: 'token-1', type: 'http-01' }
+          );
+
+          return certificateChainPem;
+        }
+      },
+      crypto: {
+        async createCsr({ commonName }, keyPem) {
+          requestedDomains.push(commonName);
+          return [Buffer.from(keyPem ?? TEST_TLS_KEY), Buffer.from(`csr:${commonName}`)];
+        },
+        async createPrivateKey() {
+          return Buffer.from(TEST_TLS_KEY);
+        }
+      }
+    },
+    baseDir: tempDir,
+    challengeStore,
+    config: {
+      ...createConfig(),
+      acme: {
+        accountKeyPath: 'acme-data/account.key',
+        directoryUrl: 'https://acme-staging-v02.api.letsencrypt.org/directory',
+        email: 'ops@example.com',
+        enabled: true,
+        managedCertificateRoot: 'managed-certs',
+        preferredChain: '',
+        renewCheckIntervalMs: 60_000,
+        renewalWindowMs: 30 * 24 * 60 * 60 * 1000,
+        skipChallengeVerification: true,
+        termsOfServiceAgreed: true
+      }
+    },
+    logStore,
+    setIntervalFn: () => 1,
+    clearIntervalFn: () => undefined,
+    tlsRegistry: registry
+  });
+
+  await manager.syncCertificates();
+  registry.reload();
+
+  assert.deepEqual(requestedDomains, ['new.example.com']);
+  assert.deepEqual(challengeLookups, ['token-1.authorized']);
+  assert.equal(challengeStore.snapshot().length, 0);
+  assert.equal(registry.lookup('chatgpt-proxy.gdmn.app').source, 'manual');
+  assert.equal(registry.lookup('new.example.com').source, 'managed');
+  assert.equal(
+    hasCompleteCertificateFiles('new.example.com', {
+      baseDir: tempDir,
+      certificateRoot: 'managed-certs'
+    }),
+    true
+  );
 });
 
 test('timeout classification distinguishes proxy timeout from unavailable upstream', () => {
