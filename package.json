@@ -6,10 +6,12 @@
   "scripts": {
     "start": "node src/index.js",
     "test": "node --test test/reverse-proxy.test.mjs",
-    "check": "node --check src/index.js && node --check src/config.js && node --check src/reverseProxy.js && node --check src/tlsRouter.js && node --check test/reverse-proxy.test.mjs",
+    "check": "node --check src/index.js && node --check src/acmeChallengeStore.js && node --check src/acmeManager.js && node --check src/config.js && node --check src/httpChallenge.js && node --check src/reverseProxy.js && node --check src/tlsCertificates.js && node --check src/tlsRegistry.js && node --check src/tlsRouter.js && node --check test/reverse-proxy.test.mjs",
     "docker": "docker build -t gsbelarus/reverse-proxy . && docker push gsbelarus/reverse-proxy"
   },
   "author": "",
   "license": "ISC",
-  "dependencies": {}
+  "dependencies": {
+    "acme-client": "^5.4.0"
+  }
 }
