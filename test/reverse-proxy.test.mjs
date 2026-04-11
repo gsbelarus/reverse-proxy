@@ -541,6 +541,13 @@ test('tls registry prefers manual certificate coverage over exact managed certif
 test('http challenge handler serves active ACME challenges before redirecting other traffic', async (t) => {
   const challengeStore = createAcmeChallengeStore();
   const logStore = createLogStore({ maxEntries: 10 });
+  const hosts = {
+    'api.example.com': {
+      host: '127.0.0.1',
+      port: 3001,
+      protocol: 'http:'
+    }
+  };
   challengeStore.set({
     identifier: 'api.example.com',
     keyAuthorization: 'token-1.authorized',
@@ -550,6 +557,7 @@ test('http challenge handler serves active ACME challenges before redirecting ot
   const server = http.createServer(
     createHttpRedirectHandler({
       challengeStore,
+      hosts,
       logStore
     })
   );
@@ -567,7 +575,7 @@ test('http challenge handler serves active ACME challenges before redirecting ot
     port
   });
   const redirectResponse = await requestProxy({
-    hostHeader: 'api.example.com',
+    hostHeader: 'www.api.example.com:80',
     path: '/health',
     port
   });
@@ -577,6 +585,69 @@ test('http challenge handler serves active ACME challenges before redirecting ot
   assert.equal(missingChallengeResponse.statusCode, 404);
   assert.equal(redirectResponse.statusCode, 301);
   assert.equal(redirectResponse.headers.location, 'https://api.example.com/health');
+});
+
+test('http redirect handler rejects missing Host headers', async (t) => {
+  const server = http.createServer(
+    createHttpRedirectHandler({
+      challengeStore: createAcmeChallengeStore(),
+      hosts: {
+        'api.example.com': {
+          host: '127.0.0.1',
+          port: 3001,
+          protocol: 'http:'
+        }
+      },
+      logStore: createLogStore({ maxEntries: 10 })
+    })
+  );
+  const port = await listen(server);
+  t.after(() => closeServer(server));
+
+  const rawResponse = await new Promise((resolve, reject) => {
+    const client = net.connect({ host: '127.0.0.1', port }, () => {
+      client.write('GET /health HTTP/1.1\r\nConnection: close\r\n\r\n');
+    });
+
+    let data = '';
+    client.setEncoding('utf8');
+    client.on('data', (chunk) => {
+      data += chunk;
+    });
+    client.on('end', () => resolve(data));
+    client.on('error', reject);
+  });
+
+  assert.match(rawResponse, /400 Bad Request/);
+  assert.doesNotMatch(rawResponse, /Location:/i);
+});
+
+test('http redirect handler rejects unknown Host headers instead of redirecting them', async (t) => {
+  const server = http.createServer(
+    createHttpRedirectHandler({
+      challengeStore: createAcmeChallengeStore(),
+      hosts: {
+        'api.example.com': {
+          host: '127.0.0.1',
+          port: 3001,
+          protocol: 'http:'
+        }
+      },
+      logStore: createLogStore({ maxEntries: 10 })
+    })
+  );
+  const port = await listen(server);
+  t.after(() => closeServer(server));
+
+  const response = await requestProxy({
+    hostHeader: 'attacker.example.net',
+    path: '/health',
+    port
+  });
+
+  assert.equal(response.statusCode, 400);
+  assert.equal(response.headers.location, undefined);
+  assert.equal(response.body, 'Bad Request');
 });
 
 test('acme manager provisions only HTTPS hosts without manual certificate coverage', async (t) => {

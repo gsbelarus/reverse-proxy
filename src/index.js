@@ -173,6 +173,7 @@ tlsRouter.listen(443, () => {
 const httpServer = http.createServer(
   createHttpRedirectHandler({
     challengeStore,
+    hosts: HOSTS,
     logStore
   })
 );

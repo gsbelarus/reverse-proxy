@@ -1,6 +1,27 @@
 const { isAcmeChallengeRequest } = require('./acmeChallengeStore');
+const { resolveHostMapping } = require('./config');
 
-const createHttpRedirectHandler = ({ challengeStore, logStore }) => (req, res) => {
+const BAD_REQUEST_STATUS_CODE = 400;
+
+const toRedirectPath = (rawUrl = '/') => {
+  try {
+    const url = new URL(String(rawUrl ?? '/'), 'http://reverse-proxy.local');
+    return `${url.pathname}${url.search}`;
+  } catch {
+    const value = String(rawUrl ?? '/');
+    return value.startsWith('/') ? value : '/';
+  }
+};
+
+const writeBadRequestResponse = (res) => {
+  res.writeHead(BAD_REQUEST_STATUS_CODE, {
+    'Cache-Control': 'no-store',
+    'Content-Type': 'text/plain; charset=utf-8'
+  });
+  res.end('Bad Request');
+};
+
+const createHttpRedirectHandler = ({ challengeStore, hosts, logStore }) => (req, res) => {
   const challenge = challengeStore?.resolveRequest(req.headers.host, req.url);
 
   if (challenge) {
@@ -34,7 +55,24 @@ const createHttpRedirectHandler = ({ challengeStore, logStore }) => (req, res) =
     return;
   }
 
-  const httpsUrl = `https://${req.headers.host ?? ''}${req.url ?? '/'}`;
+  const resolution = resolveHostMapping(req.headers.host, hosts);
+
+  if (!resolution.originalHost.trim() || !resolution.normalizedHost || !resolution.target) {
+    logStore?.append({
+      timestamp: new Date().toISOString(),
+      type: 'http',
+      event: 'http_redirect_rejected',
+      host: req.headers.host ?? '',
+      normalizedHost: resolution.normalizedHost,
+      path: req.url ?? '/',
+      reason: resolution.originalHost.trim() ? 'unknown_host' : 'missing_host'
+    });
+
+    writeBadRequestResponse(res);
+    return;
+  }
+
+  const httpsUrl = `https://${resolution.normalizedHost}${toRedirectPath(req.url)}`;
   res.writeHead(301, { Location: httpsUrl });
   res.end();
 };
