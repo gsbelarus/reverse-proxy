@@ -15,6 +15,7 @@ const require = createRequire(import.meta.url);
 const { createAcmeChallengeStore } = require('../src/acmeChallengeStore.js');
 const { createAcmeManager } = require('../src/acmeManager.js');
 const { getRuntimeConfig, resolveHostMapping } = require('../src/config.js');
+const { createHostsStore, loadHostsConfig } = require('../src/hostsConfig.js');
 const { createHttpRedirectHandler } = require('../src/httpChallenge.js');
 const {
   applyDownstreamTimeoutBudget,
@@ -195,7 +196,8 @@ const requestProxy = ({
   port,
   hostHeader = 'chatgpt-proxy.gdmn.app',
   method = 'GET',
-  path = '/'
+  path = '/',
+  headers = {}
 }) =>
   new Promise((resolve, reject) => {
     const req = http.request(
@@ -205,6 +207,7 @@ const requestProxy = ({
         method,
         path,
         headers: {
+          ...headers,
           host: hostHeader
         }
       },
@@ -321,6 +324,19 @@ const createTlsEdgeFixture = ({ hosts, config = createConfig() }) => {
 
 const createTempDir = () => fs.mkdtempSync(path.join(os.tmpdir(), 'reverse-proxy-'));
 
+const writeHostsConfigFile = (baseDir, hosts) => {
+  fs.writeFileSync(path.join(baseDir, 'hosts.json'), `${JSON.stringify(hosts, null, 2)}\n`, 'utf8');
+};
+
+const CHATGPT_PROXY_HOST_MAP = {
+  'chatgpt-proxy.gdmn.app': {
+    host: 'localhost',
+    port: 3002,
+    protocol: 'http:',
+    mode: 'http-proxy'
+  }
+};
+
 const seedCertificateFiles = async ({
   baseDir,
   certificateRoot,
@@ -343,6 +359,101 @@ const seedCertificateFiles = async ({
   );
 };
 
+test('hosts config loads external host mappings from json', (t) => {
+  const tempDir = createTempDir();
+  t.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+
+  writeHostsConfigFile(tempDir, {
+    $schema: './hosts.schema.json',
+    'api.example.com': {
+      host: '127.0.0.1',
+      port: 3001,
+      protocol: 'https:'
+    },
+    'turn.example.com': {
+      host: '127.0.0.1',
+      port: 5349,
+      mode: 'tls-passthrough'
+    }
+  });
+
+  const hosts = loadHostsConfig({ baseDir: tempDir });
+
+  assert.deepEqual(hosts, {
+    'api.example.com': {
+      host: '127.0.0.1',
+      port: 3001,
+      protocol: 'https:',
+      mode: 'http-proxy'
+    },
+    'turn.example.com': {
+      host: '127.0.0.1',
+      port: 5349,
+      mode: 'tls-passthrough'
+    }
+  });
+});
+
+test('hosts store keeps the last known good config during hot reload failures', async (t) => {
+  const tempDir = createTempDir();
+  t.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+
+  writeHostsConfigFile(tempDir, CHATGPT_PROXY_HOST_MAP);
+
+  let watchHandler = null;
+  const fakeWatcher = new EventEmitter();
+  fakeWatcher.close = () => undefined;
+
+  const store = createHostsStore({
+    baseDir: tempDir,
+    debounceMs: 0,
+    watchFn: (_directoryPath, handler) => {
+      watchHandler = handler;
+      return fakeWatcher;
+    }
+  });
+
+  t.after(() => store.close());
+
+  store.reload();
+
+  const reloadHostnames = [];
+  const reloadErrors = [];
+
+  store.watch({
+    onReload(snapshot) {
+      reloadHostnames.push(snapshot.hostnames);
+    },
+    onError(error) {
+      reloadErrors.push(error.message);
+    }
+  });
+
+  assert.ok(watchHandler);
+
+  writeHostsConfigFile(tempDir, {
+    'api.example.com': {
+      host: '127.0.0.1',
+      port: 3001,
+      protocol: 'http:'
+    }
+  });
+  watchHandler('change', 'hosts.json');
+
+  await waitFor(() => reloadHostnames.length === 1);
+
+  assert.deepEqual(reloadHostnames[0], ['api.example.com']);
+  assert.deepEqual(Object.keys(store.getHosts()), ['api.example.com']);
+
+  fs.writeFileSync(path.join(tempDir, 'hosts.json'), '{ invalid json\n', 'utf8');
+  watchHandler('rename', 'hosts.json');
+
+  await waitFor(() => reloadErrors.length === 1);
+
+  assert.deepEqual(Object.keys(store.getHosts()), ['api.example.com']);
+  assert.match(reloadErrors[0], /Failed to parse hosts config/);
+});
+
 test('host resolution strips www prefix and port', () => {
   const resolution = resolveHostMapping('www.chatgpt-proxy.gdmn.app:443', {
     'chatgpt-proxy.gdmn.app': { host: 'localhost', port: 3002 }
@@ -354,7 +465,7 @@ test('host resolution strips www prefix and port', () => {
 
 test('chatgpt-proxy defaults to a 930000 ms upstream timeout budget', () => {
   const config = getRuntimeConfig({});
-  const resolution = resolveHostMapping('chatgpt-proxy.gdmn.app');
+  const resolution = resolveHostMapping('chatgpt-proxy.gdmn.app', CHATGPT_PROXY_HOST_MAP);
   const ctx = createRequestContext({
     req: {
       method: 'GET',
@@ -374,7 +485,7 @@ test('chatgpt-proxy honors REVERSE_PROXY_CHATGPT_PROXY_TIMEOUT_MS override', () 
   const config = getRuntimeConfig({
     REVERSE_PROXY_CHATGPT_PROXY_TIMEOUT_MS: '945000'
   });
-  const resolution = resolveHostMapping('chatgpt-proxy.gdmn.app');
+  const resolution = resolveHostMapping('chatgpt-proxy.gdmn.app', CHATGPT_PROXY_HOST_MAP);
   const ctx = createRequestContext({
     req: {
       method: 'GET',
@@ -392,7 +503,7 @@ test('chatgpt-proxy honors REVERSE_PROXY_CHATGPT_PROXY_TIMEOUT_MS override', () 
 
 test('chatgpt-proxy raises downstream socket timeout to the effective budget', () => {
   const config = getRuntimeConfig({});
-  const resolution = resolveHostMapping('chatgpt-proxy.gdmn.app');
+  const resolution = resolveHostMapping('chatgpt-proxy.gdmn.app', CHATGPT_PROXY_HOST_MAP);
   const ctx = createRequestContext({
     req: {
       method: 'GET',
@@ -536,6 +647,74 @@ test('tls registry prefers manual certificate coverage over exact managed certif
   assert.equal(certificateResolution.source, 'manual');
   assert.equal(certificateResolution.certificateDomain, 'gdmn.app');
   assert.deepEqual(registry.getManagedHostnames(), ['new.example.com']);
+});
+
+test('tls registry falls back to managed certificates when a manual folder is incomplete', async (t) => {
+  const tempDir = createTempDir();
+  t.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+
+  fs.mkdirSync(path.join(tempDir, 'manual-certs', 'api.example.com'), { recursive: true });
+  await seedCertificateFiles({
+    baseDir: tempDir,
+    certificateRoot: 'managed-certs',
+    domain: 'api.example.com',
+    sourceDomain: 'alemaro.team'
+  });
+
+  const registry = createTlsRegistry({
+    baseDir: tempDir,
+    hosts: {
+      'api.example.com': {
+        host: '127.0.0.1',
+        mode: 'http-proxy',
+        port: 3001,
+        protocol: 'http:'
+      }
+    },
+    managedCertificateRoot: 'managed-certs',
+    manualCertificateRoot: 'manual-certs'
+  });
+
+  registry.reload();
+
+  assert.equal(registry.lookup('api.example.com').source, 'managed');
+  assert.deepEqual(registry.getManagedHostnames(), ['api.example.com']);
+  assert.equal(registry.getSnapshot().certificateStates[0].source, 'managed');
+});
+
+test('tls registry recalculates managed hostnames from a live host provider', () => {
+  let currentHosts = {
+    'one.example.com': {
+      host: '127.0.0.1',
+      port: 3001,
+      protocol: 'http:',
+      mode: 'http-proxy'
+    }
+  };
+
+  const registry = createTlsRegistry({
+    hosts: () => currentHosts
+  });
+
+  registry.reload();
+  assert.deepEqual(registry.getManagedHostnames(), ['one.example.com']);
+
+  currentHosts = {
+    'two.example.com': {
+      host: '127.0.0.1',
+      port: 3002,
+      protocol: 'http:',
+      mode: 'http-proxy'
+    },
+    'webrtc-turns.gdmn.app': {
+      host: '127.0.0.1',
+      port: 5349,
+      mode: 'tls-passthrough'
+    }
+  };
+
+  registry.reload();
+  assert.deepEqual(registry.getManagedHostnames(), ['two.example.com']);
 });
 
 test('http challenge handler serves active ACME challenges before redirecting other traffic', async (t) => {
@@ -768,6 +947,88 @@ test('acme manager provisions only HTTPS hosts without manual certificate covera
   );
 });
 
+test('acme manager provisions tls hosts added by the live host provider', async (t) => {
+  const tempDir = createTempDir();
+  t.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+
+  let currentHosts = {
+    'existing.example.com': {
+      host: '127.0.0.1',
+      mode: 'http-proxy',
+      port: 3001,
+      protocol: 'http:'
+    }
+  };
+
+  const registry = createTlsRegistry({
+    baseDir: tempDir,
+    hosts: () => currentHosts,
+    managedCertificateRoot: 'managed-certs',
+    manualCertificateRoot: 'manual-certs'
+  });
+  const challengeStore = createAcmeChallengeStore();
+  const logStore = createLogStore({ maxEntries: 50 });
+  const requestedDomains = [];
+  const certificateChainPem = loadDomainCertificateFiles('gdmn.app').certChainPem;
+
+  const manager = createAcmeManager({
+    acmeModule: {
+      Client: class {
+        async auto() {
+          return certificateChainPem;
+        }
+      },
+      crypto: {
+        async createCsr({ commonName }, keyPem) {
+          requestedDomains.push(commonName);
+          return [Buffer.from(keyPem ?? TEST_TLS_KEY), Buffer.from(`csr:${commonName}`)];
+        },
+        async createPrivateKey() {
+          return Buffer.from(TEST_TLS_KEY);
+        }
+      }
+    },
+    baseDir: tempDir,
+    challengeStore,
+    config: {
+      ...createConfig(),
+      acme: {
+        accountKeyPath: 'acme-data/account.key',
+        directoryUrl: 'https://acme-staging-v02.api.letsencrypt.org/directory',
+        email: 'ops@example.com',
+        enabled: true,
+        managedCertificateRoot: 'managed-certs',
+        preferredChain: '',
+        renewCheckIntervalMs: 60_000,
+        renewalWindowMs: 30 * 24 * 60 * 60 * 1000,
+        skipChallengeVerification: true,
+        termsOfServiceAgreed: true
+      }
+    },
+    logStore,
+    setIntervalFn: () => 1,
+    clearIntervalFn: () => undefined,
+    tlsRegistry: registry
+  });
+
+  await manager.syncCertificates();
+
+  currentHosts = {
+    ...currentHosts,
+    'added.example.com': {
+      host: '127.0.0.1',
+      mode: 'http-proxy',
+      port: 3002,
+      protocol: 'http:'
+    }
+  };
+
+  await manager.syncCertificates();
+
+  assert.deepEqual(requestedDomains, ['existing.example.com', 'added.example.com']);
+  assert.equal(registry.lookup('added.example.com').source, 'managed');
+});
+
 test('timeout classification distinguishes proxy timeout from unavailable upstream', () => {
   const timeoutResult = classifyProxyError(
     createProxyError('REVERSE_PROXY_TIMEOUT', 'timed out', { isUpstream: true })
@@ -998,9 +1259,305 @@ test('structured logs include request ids and sanitize sensitive query params', 
 
   const entry = fixture.logStore.snapshot(fixture.tracker.snapshot()).entries[0];
   assert.ok(entry.requestId);
+  assert.equal(entry.edgeRequestId, entry.requestId);
+  assert.equal(entry.clientRequestId, null);
+  assert.equal(entry.upstreamRequestId, null);
   assert.equal(entry.path, '/health?token=%5Bredacted%5D&safe=1');
+  assert.equal(entry.statusSource, 'upstream');
+  assert.equal(entry.upstreamStatusCode, 204);
+  assert.equal(entry.timeoutValues.inboundTimeoutMs, 500);
   assert.equal(entry.timeoutValues.connectTimeoutMs, 75);
   assert.equal(entry.timeoutValues.upstreamTimeoutMs, 150);
+  assert.equal(entry.timeoutValues.chatgptProxyTimeoutOverrideUsed, true);
+});
+
+test('incoming client request ids are preserved separately from edge request ids', async (t) => {
+  const upstreamServer = http.createServer((_req, res) => {
+    res.writeHead(204);
+    res.end();
+  });
+  const upstreamPort = await listen(upstreamServer);
+  t.after(() => closeServer(upstreamServer));
+
+  const fixture = createProxyFixture({
+    hosts: {
+      'chatgpt-proxy.gdmn.app': {
+        host: '127.0.0.1',
+        port: upstreamPort,
+        protocol: 'http:'
+      }
+    }
+  });
+
+  const proxyPort = await listen(fixture.server);
+  t.after(() => closeServer(fixture.server));
+
+  const clientRequestId = 'client-request-1';
+  const response = await requestProxy({
+    port: proxyPort,
+    headers: {
+      'x-request-id': clientRequestId
+    }
+  });
+
+  assert.equal(response.statusCode, 204);
+
+  const entry = fixture.logStore.snapshot(fixture.tracker.snapshot()).entries[0];
+  assert.equal(entry.clientRequestId, clientRequestId);
+  assert.ok(entry.edgeRequestId);
+  assert.notEqual(entry.edgeRequestId, clientRequestId);
+  assert.equal(entry.requestId, entry.edgeRequestId);
+  assert.equal(response.headers['x-request-id'], entry.edgeRequestId);
+});
+
+test('forwarded headers include both client and edge request ids', async (t) => {
+  let forwardedHeaders = null;
+  const upstreamServer = http.createServer((req, res) => {
+    forwardedHeaders = req.headers;
+    res.writeHead(204);
+    res.end();
+  });
+  const upstreamPort = await listen(upstreamServer);
+  t.after(() => closeServer(upstreamServer));
+
+  const fixture = createProxyFixture({
+    hosts: {
+      'chatgpt-proxy.gdmn.app': {
+        host: '127.0.0.1',
+        port: upstreamPort,
+        protocol: 'http:'
+      }
+    }
+  });
+
+  const proxyPort = await listen(fixture.server);
+  t.after(() => closeServer(fixture.server));
+
+  const clientRequestId = 'client-request-2';
+  const response = await requestProxy({
+    port: proxyPort,
+    headers: {
+      'x-request-id': clientRequestId
+    }
+  });
+
+  assert.equal(response.statusCode, 204);
+  assert.ok(forwardedHeaders);
+  assert.equal(forwardedHeaders['x-client-request-id'], clientRequestId);
+  assert.ok(forwardedHeaders['x-request-id']);
+  assert.notEqual(forwardedHeaders['x-request-id'], clientRequestId);
+  assert.equal(response.headers['x-request-id'], forwardedHeaders['x-request-id']);
+});
+
+test('upstream request ids and upstream http failures are surfaced in responses and logs', async (t) => {
+  const upstreamRequestId = 'upstream-request-1';
+  const upstreamServer = http.createServer((_req, res) => {
+    res.writeHead(502, {
+      'Content-Type': 'application/json',
+      'x-request-id': upstreamRequestId
+    });
+    res.end(JSON.stringify({ error: 'upstream bad gateway' }));
+  });
+  const upstreamPort = await listen(upstreamServer);
+  t.after(() => closeServer(upstreamServer));
+
+  const fixture = createProxyFixture({
+    hosts: {
+      'chatgpt-proxy.gdmn.app': {
+        host: '127.0.0.1',
+        port: upstreamPort,
+        protocol: 'http:'
+      }
+    }
+  });
+
+  const proxyPort = await listen(fixture.server);
+  t.after(() => closeServer(fixture.server));
+
+  const response = await requestProxy({
+    port: proxyPort,
+    path: '/upstream-failure'
+  });
+
+  assert.equal(response.statusCode, 502);
+  assert.match(response.body, /upstream bad gateway/);
+  assert.ok(response.headers['x-request-id']);
+  assert.notEqual(response.headers['x-request-id'], upstreamRequestId);
+  assert.equal(response.headers['x-upstream-request-id'], upstreamRequestId);
+
+  const entry = fixture.logStore.snapshot(fixture.tracker.snapshot()).entries[0];
+  assert.equal(entry.edgeRequestId, response.headers['x-request-id']);
+  assert.equal(entry.upstreamRequestId, upstreamRequestId);
+  assert.equal(entry.statusSource, 'upstream');
+  assert.equal(entry.statusCode, 502);
+  assert.equal(entry.proxyStatusCode, null);
+  assert.equal(entry.upstreamStatusCode, 502);
+  assert.equal(entry.resultCategory, 'upstream_http_error');
+});
+
+test('proxy-generated timeout logs include the effective chatgpt timeout budget', async (t) => {
+  const upstreamServer = http.createServer(async (_req, _res) => {
+    await delay(400);
+  });
+  const upstreamPort = await listen(upstreamServer);
+  t.after(() => closeServer(upstreamServer));
+
+  const fixture = createProxyFixture({
+    config: createConfig({
+      inboundTimeoutMs: 80,
+      upstreamTimeoutMs: 120,
+      chatgptProxyTimeoutMs: 180,
+      connectTimeoutMs: 35
+    }),
+    hosts: {
+      'chatgpt-proxy.gdmn.app': {
+        host: '127.0.0.1',
+        port: upstreamPort,
+        protocol: 'http:'
+      }
+    }
+  });
+
+  const proxyPort = await listen(fixture.server);
+  t.after(() => closeServer(fixture.server));
+
+  const response = await requestProxy({
+    port: proxyPort,
+    path: '/slow'
+  });
+  const body = JSON.parse(response.body);
+
+  assert.equal(response.statusCode, 504);
+  assert.equal(body.error.type, 'upstream_timeout');
+
+  const entry = fixture.logStore.snapshot(fixture.tracker.snapshot()).entries[0];
+  assert.equal(entry.routeHost, 'chatgpt-proxy.gdmn.app');
+  assert.equal(entry.statusSource, 'edge');
+  assert.equal(entry.statusCode, 504);
+  assert.equal(entry.proxyStatusCode, 504);
+  assert.equal(entry.upstreamStatusCode, null);
+  assert.equal(entry.timeoutValues.connectTimeoutMs, 35);
+  assert.equal(entry.timeoutValues.upstreamTimeoutMs, 180);
+  assert.equal(entry.timeoutValues.inboundTimeoutMs, 80);
+  assert.equal(entry.timeoutValues.chatgptProxyTimeoutOverrideUsed, true);
+});
+
+test('reverse proxy log snapshot exposes correlation and timeout fields', async (t) => {
+  const upstreamRequestId = 'upstream-request-2';
+  const upstreamServer = http.createServer((_req, res) => {
+    res.writeHead(204, {
+      'x-request-id': upstreamRequestId
+    });
+    res.end();
+  });
+  const upstreamPort = await listen(upstreamServer);
+  t.after(() => closeServer(upstreamServer));
+
+  const fixture = createProxyFixture({
+    config: createConfig({
+      inboundTimeoutMs: 45,
+      upstreamTimeoutMs: 65,
+      chatgptProxyTimeoutMs: 95,
+      connectTimeoutMs: 35
+    }),
+    hosts: {
+      'chatgpt-proxy.gdmn.app': {
+        host: '127.0.0.1',
+        port: upstreamPort,
+        protocol: 'http:'
+      }
+    }
+  });
+
+  const proxyPort = await listen(fixture.server);
+  t.after(() => closeServer(fixture.server));
+
+  const clientRequestId = 'client-request-3';
+  const upstreamResponse = await requestProxy({
+    port: proxyPort,
+    path: '/snapshot-source',
+    headers: {
+      'x-request-id': clientRequestId
+    }
+  });
+  const snapshotResponse = await requestProxy({
+    port: proxyPort,
+    path: '/_reverse_proxy_log'
+  });
+
+  assert.equal(upstreamResponse.statusCode, 204);
+  assert.equal(snapshotResponse.statusCode, 200);
+
+  const snapshot = JSON.parse(snapshotResponse.body);
+  const entry = snapshot.entries[0];
+
+  assert.equal(snapshot.summary.timeoutValues.inboundTimeoutMs, 45);
+  assert.equal(snapshot.summary.timeoutValues.upstreamTimeoutMs, 65);
+  assert.equal(snapshot.summary.timeoutValues.chatgptProxyTimeoutMs, 95);
+  assert.equal(snapshot.summary.timeoutValues.connectTimeoutMs, 35);
+  assert.equal(entry.routeHost, 'chatgpt-proxy.gdmn.app');
+  assert.equal(entry.edgeRequestId, upstreamResponse.headers['x-request-id']);
+  assert.equal(entry.clientRequestId, clientRequestId);
+  assert.equal(entry.upstreamRequestId, upstreamRequestId);
+  assert.equal(entry.timeoutValues.connectTimeoutMs, 35);
+  assert.equal(entry.timeoutValues.upstreamTimeoutMs, 95);
+  assert.equal(entry.timeoutValues.inboundTimeoutMs, 45);
+  assert.equal(entry.timeoutValues.chatgptProxyTimeoutOverrideUsed, true);
+});
+
+test('proxy handlers pick up host mapping changes from a live host provider without restart', async (t) => {
+  const firstUpstreamServer = http.createServer((_req, res) => {
+    res.writeHead(204);
+    res.end();
+  });
+  const firstUpstreamPort = await listen(firstUpstreamServer);
+  t.after(() => closeServer(firstUpstreamServer));
+
+  const secondUpstreamServer = http.createServer((_req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('reloaded');
+  });
+  const secondUpstreamPort = await listen(secondUpstreamServer);
+  t.after(() => closeServer(secondUpstreamServer));
+
+  let currentHosts = {
+    'chatgpt-proxy.gdmn.app': {
+      host: '127.0.0.1',
+      port: firstUpstreamPort,
+      protocol: 'http:'
+    }
+  };
+
+  const fixture = createProxyFixture({
+    hosts: () => currentHosts
+  });
+
+  const proxyPort = await listen(fixture.server);
+  t.after(() => closeServer(fixture.server));
+
+  const initialResponse = await requestProxy({ port: proxyPort });
+  assert.equal(initialResponse.statusCode, 204);
+
+  currentHosts = {
+    'api.example.com': {
+      host: '127.0.0.1',
+      port: secondUpstreamPort,
+      protocol: 'http:'
+    }
+  };
+
+  const removedHostResponse = await requestProxy({
+    port: proxyPort,
+    hostHeader: 'chatgpt-proxy.gdmn.app'
+  });
+  const addedHostResponse = await requestProxy({
+    port: proxyPort,
+    hostHeader: 'api.example.com'
+  });
+
+  assert.equal(removedHostResponse.statusCode, 404);
+  assert.equal(addedHostResponse.statusCode, 200);
+  assert.equal(addedHostResponse.body, 'reloaded');
 });
 
 test('upgrade requests are proxied for mapped hosts', async (t) => {

@@ -1,0 +1,32 @@
+{
+  "$schema": "./hosts.schema.json",
+  "chatgpt-proxy.gdmn.app": {
+    "host": "localhost",
+    "port": 3002,
+    "protocol": "http:",
+    "mode": "http-proxy"
+  },
+  "naytron.dev": {
+    "host": "localhost",
+    "port": 8080,
+    "protocol": "http:",
+    "mode": "http-proxy"
+  },
+  "alemaro.team": {
+    "host": "localhost",
+    "port": 3003,
+    "protocol": "http:",
+    "mode": "http-proxy"
+  },
+  "socket-server.gdmn.app": {
+    "host": "localhost",
+    "port": 3030,
+    "protocol": "http:",
+    "mode": "http-proxy"
+  },
+  "webrtc-turns.gdmn.app": {
+    "host": "localhost",
+    "port": 5349,
+    "mode": "tls-passthrough"
+  }
+}

@@ -1,8 +1,8 @@
 const { createSecureContext } = require('tls');
 
-const { normalizeHost } = require('./config');
+const { getHostMap, normalizeHost } = require('./config');
 const {
-  discoverCertificateDomains,
+  discoverCertificateDirectories,
   getCertificateNotAfter,
   hasCompleteCertificateFiles,
   loadDomainCertificateFiles
@@ -31,6 +31,7 @@ const createTlsRegistry = ({
     managedHostnames: [],
     managedEntries: new Map(),
     managedErrors: new Map(),
+    manualErrorDomains: [],
     manualEntries: [],
     manualErrors: new Map(),
     manualOverrideDomains: []
@@ -45,7 +46,7 @@ const createTlsRegistry = ({
   };
 
   const getTlsTerminatedHosts = () =>
-    Object.entries(hosts)
+    Object.entries(getHostMap(hosts))
       .filter(([, target]) => isTlsTerminatedTarget(target))
       .map(([host]) => normalizeHost(host))
       .sort((left, right) => left.localeCompare(right));
@@ -80,8 +81,11 @@ const createTlsRegistry = ({
   const findManualOverrideDomain = (host) =>
     state.manualOverrideDomains.find((domain) => hostMatchesCertificateDomain(host, domain)) ?? null;
 
+  const findManualErrorDomain = (host) =>
+    state.manualErrorDomains.find((domain) => hostMatchesCertificateDomain(host, domain)) ?? null;
+
   const findManualError = (host) => {
-    const domain = findManualOverrideDomain(host);
+    const domain = findManualErrorDomain(host);
 
     if (!domain) {
       return null;
@@ -92,14 +96,32 @@ const createTlsRegistry = ({
   };
 
   const reload = () => {
-    const manualOverrideDomains = discoverCertificateDomains({
+    const manualCandidateDomains = discoverCertificateDirectories({
       baseDir,
       certificateRoot: manualCertificateRoot
     }).sort(byDomainNameSpecificity);
     const manualEntries = [];
     const manualErrors = new Map();
 
-    for (const domain of manualOverrideDomains) {
+    for (const domain of manualCandidateDomains) {
+      if (
+        !hasCompleteCertificateFiles(domain, {
+          baseDir,
+          certificateRoot: manualCertificateRoot
+        })
+      ) {
+        const error = new Error(`Incomplete manual certificate bundle for ${domain}`);
+
+        manualErrors.set(domain, error);
+        appendLog({
+          event: 'ssl_context_load_skipped',
+          domain,
+          source: 'manual',
+          message: error.message
+        });
+        continue;
+      }
+
       try {
         manualEntries.push(loadEntry(domain, 'manual', manualCertificateRoot));
       } catch (error) {
@@ -114,6 +136,10 @@ const createTlsRegistry = ({
     }
 
     manualEntries.sort(byDomainSpecificity);
+    const manualOverrideDomains = manualEntries
+      .map((entry) => entry.domain)
+      .sort(byDomainNameSpecificity);
+    const manualErrorDomains = [...manualErrors.keys()].sort(byDomainNameSpecificity);
 
     const managedHostnames = getTlsTerminatedHosts().filter(
       (host) => !manualOverrideDomains.some((domain) => hostMatchesCertificateDomain(host, domain))
@@ -157,20 +183,6 @@ const createTlsRegistry = ({
         };
       }
 
-      const manualErrorDomain = manualOverrideDomains.find((domain) =>
-        hostMatchesCertificateDomain(host, domain)
-      );
-
-      if (manualErrorDomain) {
-        return {
-          certificateDomain: manualErrorDomain,
-          hasContext: false,
-          host,
-          message: manualErrors.get(manualErrorDomain)?.message ?? 'Failed to load manual certificate',
-          source: 'manual_invalid'
-        };
-      }
-
       const managedEntry = managedEntries.get(host);
 
       if (managedEntry) {
@@ -193,6 +205,20 @@ const createTlsRegistry = ({
         };
       }
 
+      const manualErrorDomain = manualErrorDomains.find((domain) =>
+        hostMatchesCertificateDomain(host, domain)
+      );
+
+      if (manualErrorDomain) {
+        return {
+          certificateDomain: manualErrorDomain,
+          hasContext: false,
+          host,
+          message: manualErrors.get(manualErrorDomain)?.message ?? 'Failed to load manual certificate',
+          source: 'manual_invalid'
+        };
+      }
+
       return {
         certificateDomain: host,
         hasContext: false,
@@ -206,6 +232,7 @@ const createTlsRegistry = ({
       managedHostnames,
       managedEntries,
       managedErrors,
+      manualErrorDomains,
       manualEntries,
       manualErrors,
       manualOverrideDomains
@@ -224,17 +251,6 @@ const createTlsRegistry = ({
         context: manualEntry.context,
         notAfter: manualEntry.notAfter,
         source: 'manual'
-      };
-    }
-
-    const manualError = findManualError(normalizedHost);
-
-    if (manualError) {
-      return {
-        certificateDomain: manualError.certificateDomain,
-        context: null,
-        error: manualError.error,
-        source: 'manual_invalid'
       };
     }
 
@@ -257,6 +273,17 @@ const createTlsRegistry = ({
         context: null,
         error: managedError,
         source: 'managed_invalid'
+      };
+    }
+
+    const manualError = findManualError(normalizedHost);
+
+    if (manualError) {
+      return {
+        certificateDomain: manualError.certificateDomain,
+        context: null,
+        error: manualError.error,
+        source: 'manual_invalid'
       };
     }
 

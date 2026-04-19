@@ -33,6 +33,22 @@ const getCertificateFilePaths = (
   };
 };
 
+const discoverCertificateDirectories = (
+  { baseDir = process.cwd(), fsModule = fs, certificateRoot = 'ssl' } = {}
+) => {
+  const rootPath = path.resolve(baseDir, certificateRoot);
+
+  if (!fsModule.existsSync(rootPath)) {
+    return [];
+  }
+
+  return fsModule
+    .readdirSync(rootPath, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name)
+    .sort((left, right) => left.localeCompare(right));
+};
+
 const hasCompleteCertificateFiles = (
   domain,
   { baseDir = process.cwd(), fsModule = fs, certificateRoot = 'ssl' } = {}
@@ -48,16 +64,11 @@ const hasCompleteCertificateFiles = (
 const discoverCertificateDomains = (
   { baseDir = process.cwd(), fsModule = fs, certificateRoot = 'ssl' } = {}
 ) => {
-  const rootPath = path.resolve(baseDir, certificateRoot);
-
-  if (!fsModule.existsSync(rootPath)) {
-    return [];
-  }
-
-  return fsModule
-    .readdirSync(rootPath, { withFileTypes: true })
-    .filter((entry) => entry.isDirectory())
-    .map((entry) => entry.name)
+  return discoverCertificateDirectories({
+    baseDir,
+    fsModule,
+    certificateRoot
+  })
     .filter((domain) =>
       hasCompleteCertificateFiles(domain, {
         baseDir,
@@ -182,6 +193,7 @@ const writeDomainCertificateFiles = async (
 
 module.exports = {
   buildCertificateChainPem,
+  discoverCertificateDirectories,
   discoverCertificateDomains,
   getCertificateFilePaths,
   getCertificateNotAfter,
