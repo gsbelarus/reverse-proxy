@@ -2,10 +2,11 @@ const http = require('http');
 const https = require('https');
 const net = require('net');
 
-const { HOSTS, getRuntimeConfig } = require('./config');
+const { getRuntimeConfig } = require('./config');
 const { createAcmeManager } = require('./acmeManager');
 const { createAcmeChallengeStore } = require('./acmeChallengeStore');
 const { createHttpRedirectHandler } = require('./httpChallenge');
+const { createHostsStore } = require('./hostsConfig');
 const {
   createLogStore,
   createProxyRequestHandler,
@@ -24,9 +25,39 @@ const passthroughTracker = createRequestTracker({
   maxParallelRequests: config.maxParallelRequests
 });
 const challengeStore = createAcmeChallengeStore();
+const hostsStore = createHostsStore({
+  baseDir: process.cwd()
+});
+
+let initialHostsSnapshot;
+
+try {
+  initialHostsSnapshot = hostsStore.reload();
+} catch (error) {
+  logStore.append({
+    timestamp: new Date().toISOString(),
+    type: 'config',
+    event: 'hosts_config_load_failed',
+    filePath: hostsStore.getFilePath(),
+    message: error.message
+  });
+  throw error;
+}
+
+const getHosts = () => hostsStore.getHosts();
+
+logStore.append({
+  timestamp: new Date().toISOString(),
+  type: 'config',
+  event: 'hosts_config_loaded',
+  filePath: initialHostsSnapshot.filePath,
+  hostCount: initialHostsSnapshot.hostCount,
+  hosts: initialHostsSnapshot.hostnames
+});
+
 const tlsRegistry = createTlsRegistry({
   baseDir: process.cwd(),
-  hosts: HOSTS,
+  hosts: getHosts,
   logStore,
   managedCertificateRoot: config.acme.managedCertificateRoot,
   manualCertificateRoot: 'ssl'
@@ -40,6 +71,50 @@ const acmeManager = createAcmeManager({
   config,
   logStore,
   tlsRegistry
+});
+
+let listenersReady = 0;
+
+const handleHostsReload = async (snapshot) => {
+  tlsRegistry.reload();
+  logStore.append({
+    timestamp: new Date().toISOString(),
+    type: 'config',
+    event: 'hosts_config_reloaded',
+    filePath: snapshot.filePath,
+    hostCount: snapshot.hostCount,
+    hosts: snapshot.hostnames
+  });
+
+  if (listenersReady < 2) {
+    return;
+  }
+
+  try {
+    await acmeManager.syncCertificates();
+  } catch (error) {
+    logStore.append({
+      timestamp: new Date().toISOString(),
+      type: 'acme',
+      event: 'acme_sync_failed_after_hosts_reload',
+      message: error.message
+    });
+  }
+};
+
+hostsStore.watch({
+  onReload(snapshot) {
+    void handleHostsReload(snapshot);
+  },
+  onError(error) {
+    logStore.append({
+      timestamp: new Date().toISOString(),
+      type: 'config',
+      event: 'hosts_config_reload_failed',
+      filePath: hostsStore.getFilePath(),
+      message: error.message
+    });
+  }
 });
 
 const sslOptions = {
@@ -65,7 +140,7 @@ const sslOptions = {
 };
 
 const app = createProxyRequestHandler({
-  hosts: HOSTS,
+  hosts: getHosts,
   config,
   tracker,
   logStore,
@@ -77,6 +152,7 @@ const app = createProxyRequestHandler({
       timeoutValues: {
         inboundTimeoutMs: config.inboundTimeoutMs,
         upstreamTimeoutMs: config.upstreamTimeoutMs,
+        chatgptProxyTimeoutMs: config.chatgptProxyTimeoutMs ?? config.upstreamTimeoutMs,
         connectTimeoutMs: config.connectTimeoutMs
       },
       tlsPassthroughConnections: toPassthroughSummary(passthroughTracker),
@@ -85,7 +161,7 @@ const app = createProxyRequestHandler({
   }
 });
 const upgradeHandler = createUpgradeProxyHandler({
-  hosts: HOSTS,
+  hosts: getHosts,
   config,
   tracker,
   logStore
@@ -116,10 +192,11 @@ logStore.append({
   timestamp: new Date().toISOString(),
   type: 'startup',
   event: 'https_handler_ready',
-  hosts: Object.keys(HOSTS),
+  hosts: initialHostsSnapshot.hostnames,
   timeoutValues: {
     inboundTimeoutMs: config.inboundTimeoutMs,
     upstreamTimeoutMs: config.upstreamTimeoutMs,
+    chatgptProxyTimeoutMs: config.chatgptProxyTimeoutMs ?? config.upstreamTimeoutMs,
     connectTimeoutMs: config.connectTimeoutMs
   },
   maxParallelRequests: config.maxParallelRequests,
@@ -128,7 +205,7 @@ logStore.append({
 
 const tlsRouter = net.createServer(
   createTlsRouterHandler({
-    hosts: HOSTS,
+    hosts: getHosts,
     httpsServer,
     config,
     tracker: passthroughTracker,
@@ -136,7 +213,6 @@ const tlsRouter = net.createServer(
   })
 );
 
-let listenersReady = 0;
 const maybeStartAcme = async () => {
   listenersReady += 1;
 
@@ -162,7 +238,7 @@ tlsRouter.listen(443, () => {
     type: 'startup',
     event: 'tls_router_listening',
     port: 443,
-    passthroughHosts: Object.entries(HOSTS)
+    passthroughHosts: Object.entries(getHosts())
       .filter(([, target]) => target.mode === 'tls-passthrough')
       .map(([host]) => host)
   });
@@ -173,7 +249,7 @@ tlsRouter.listen(443, () => {
 const httpServer = http.createServer(
   createHttpRedirectHandler({
     challengeStore,
-    hosts: HOSTS,
+    hosts: getHosts,
     logStore
   })
 );
@@ -193,6 +269,7 @@ httpServer.listen(80, () => {
 
 for (const signal of ['SIGINT', 'SIGTERM']) {
   process.once(signal, () => {
+    hostsStore.close();
     acmeManager.stop();
   });
 }

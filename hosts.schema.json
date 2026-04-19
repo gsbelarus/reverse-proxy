@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "./hosts.schema.json",
+  "title": "Reverse Proxy Hosts Config",
+  "description": "Host-to-upstream mappings for the reverse proxy runtime.",
+  "type": "object",
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "Optional editor hint for the local JSON schema file."
+    }
+  },
+  "patternProperties": {
+    "^(?!\\$schema$)(?!www\\.)[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*$": {
+      "$ref": "#/$defs/target"
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "target": {
+      "type": "object",
+      "required": [
+        "host",
+        "port"
+      ],
+      "properties": {
+        "host": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Upstream host or IP address."
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Upstream port."
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "http-proxy",
+            "tls-passthrough"
+          ],
+          "description": "Routing mode for the host. Defaults to http-proxy when omitted."
+        },
+        "protocol": {
+          "type": "string",
+          "enum": [
+            "http:",
+            "https:"
+          ],
+          "description": "Upstream protocol used by http-proxy targets."
+        },
+        "connectTimeoutMs": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Optional per-target connect timeout override in milliseconds."
+        },
+        "upstreamTimeoutMs": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Optional per-target idle timeout override in milliseconds."
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

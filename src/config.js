@@ -10,32 +10,6 @@ const DEFAULT_ACME_MANAGED_CERTIFICATE_ROOT = 'acme-data/certificates';
 const DEFAULT_ACME_ACCOUNT_KEY_PATH = 'acme-data/account.key';
 const DEFAULT_ACME_DIRECTORY_URL = 'https://acme-v02.api.letsencrypt.org/directory';
 
-const HOSTS = Object.freeze({
-  'chatgpt-proxy.gdmn.app': Object.freeze({
-    host: 'localhost',
-    port: 3002,
-    protocol: 'http:',
-    mode: 'http-proxy'
-  }),
-  'alemaro.team': Object.freeze({
-    host: 'localhost',
-    port: 3003,
-    protocol: 'http:',
-    mode: 'http-proxy'
-  }),
-  'socket-server.gdmn.app': Object.freeze({
-    host: 'localhost',
-    port: 3030,
-    protocol: 'http:',
-    mode: 'http-proxy'
-  }),
-  'webrtc-turns.gdmn.app': Object.freeze({
-    host: 'localhost',
-    port: 5349,
-    mode: 'tls-passthrough'
-  })
-});
-
 const parsePositiveInteger = (value, fallback) => {
   const parsed = Number.parseInt(value, 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
@@ -150,18 +124,28 @@ const normalizeHost = (hostHeader = '') => {
   return lowerCaseHost;
 };
 
-const resolveHostMapping = (hostHeader, hostMap = HOSTS) => {
+const getHostMap = (hostMap = {}) => {
+  if (typeof hostMap === 'function') {
+    const providedHostMap = hostMap();
+    return providedHostMap && typeof providedHostMap === 'object' ? providedHostMap : {};
+  }
+
+  return hostMap && typeof hostMap === 'object' ? hostMap : {};
+};
+
+const resolveHostMapping = (hostHeader, hostMap = {}) => {
   const normalizedHost = normalizeHost(hostHeader);
+  const currentHostMap = getHostMap(hostMap);
 
   return {
     originalHost: String(hostHeader ?? ''),
     normalizedHost,
-    target: hostMap[normalizedHost] ?? null
+    target: currentHostMap[normalizedHost] ?? null
   };
 };
 
 module.exports = {
-  HOSTS,
+  getHostMap,
   getRuntimeConfig,
   normalizeHost,
   resolveHostMapping

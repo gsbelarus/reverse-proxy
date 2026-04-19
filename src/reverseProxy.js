@@ -8,6 +8,10 @@ const { randomUUID } = require('crypto');
 const { resolveHostMapping } = require('./config');
 
 const CHATGPT_PROXY_HOST = 'chatgpt-proxy.gdmn.app';
+const EDGE_REQUEST_ID_HEADER = 'x-request-id';
+const CLIENT_REQUEST_ID_HEADER = 'x-client-request-id';
+const UPSTREAM_REQUEST_ID_HEADER = 'x-upstream-request-id';
+const MAX_REQUEST_ID_LENGTH = 256;
 
 const HOP_BY_HOP_HEADERS = new Set([
   'connection',
@@ -164,18 +168,31 @@ const createProxyError = (code, message, extra = {}) => {
   return error;
 };
 
-const createCompletionResult = (statusCode, kind = 'http') => ({
+const createCompletionResult = (
   statusCode,
-  type: 'completed',
-  code: 'SUCCESS',
-  message:
-    kind === 'upgrade'
-      ? 'Upgrade tunnel completed'
-      : 'Upstream response completed',
-  resultCategory: 'completed',
-  respond: false,
-  error: null
-});
+  { kind = 'http', upstreamRequestId = null } = {}
+) => {
+  const isUpstreamHttpError = kind === 'http' && statusCode >= 400;
+
+  return {
+    statusCode,
+    type: isUpstreamHttpError ? 'upstream_http_error' : 'completed',
+    code: isUpstreamHttpError ? 'UPSTREAM_HTTP_ERROR' : 'SUCCESS',
+    message:
+      kind === 'upgrade'
+        ? 'Upgrade tunnel completed'
+        : isUpstreamHttpError
+          ? `Upstream service responded with HTTP ${statusCode}`
+          : 'Upstream response completed',
+    resultCategory: isUpstreamHttpError ? 'upstream_http_error' : 'completed',
+    statusSource: 'upstream',
+    proxyStatusCode: null,
+    upstreamStatusCode: statusCode,
+    upstreamRequestId,
+    respond: false,
+    error: null
+  };
+};
 
 const isHttpProxyTarget = (target) => {
   if (!target) {
@@ -188,12 +205,34 @@ const isHttpProxyTarget = (target) => {
   return mode === 'http-proxy' && (protocol === 'http:' || protocol === 'https:');
 };
 
+const createEdgeResult = ({
+  statusCode,
+  type,
+  code,
+  message,
+  resultCategory,
+  respond,
+  error
+}) => ({
+  statusCode,
+  type,
+  code,
+  message,
+  resultCategory,
+  statusSource: 'edge',
+  proxyStatusCode: statusCode,
+  upstreamStatusCode: null,
+  upstreamRequestId: null,
+  respond,
+  error
+});
+
 const classifyProxyError = (error = createProxyError('REVERSE_PROXY_BAD_GATEWAY', 'Bad Gateway')) => {
   const sanitizedError = sanitizeError(error);
 
   switch (error.code) {
     case 'REVERSE_PROXY_NOT_FOUND':
-      return {
+      return createEdgeResult({
         statusCode: 404,
         type: 'unknown_host',
         code: 'REVERSE_PROXY_NOT_FOUND',
@@ -201,9 +240,9 @@ const classifyProxyError = (error = createProxyError('REVERSE_PROXY_BAD_GATEWAY'
         resultCategory: 'not_found',
         respond: true,
         error: sanitizedError
-      };
+      });
     case 'REVERSE_PROXY_OVERLOAD':
-      return {
+      return createEdgeResult({
         statusCode: 503,
         type: 'overloaded',
         code: 'REVERSE_PROXY_OVERLOAD',
@@ -211,9 +250,9 @@ const classifyProxyError = (error = createProxyError('REVERSE_PROXY_BAD_GATEWAY'
         resultCategory: 'overloaded',
         respond: true,
         error: sanitizedError
-      };
+      });
     case 'REVERSE_PROXY_CONNECT_TIMEOUT':
-      return {
+      return createEdgeResult({
         statusCode: 504,
         type: 'upstream_timeout',
         code: 'REVERSE_PROXY_CONNECT_TIMEOUT',
@@ -221,10 +260,10 @@ const classifyProxyError = (error = createProxyError('REVERSE_PROXY_BAD_GATEWAY'
         resultCategory: 'timed_out',
         respond: true,
         error: sanitizedError
-      };
+      });
     case 'REVERSE_PROXY_TIMEOUT':
     case 'ETIMEDOUT':
-      return {
+      return createEdgeResult({
         statusCode: 504,
         type: 'upstream_timeout',
         code: 'REVERSE_PROXY_TIMEOUT',
@@ -232,9 +271,9 @@ const classifyProxyError = (error = createProxyError('REVERSE_PROXY_BAD_GATEWAY'
         resultCategory: 'timed_out',
         respond: true,
         error: sanitizedError
-      };
+      });
     case 'REVERSE_PROXY_BAD_UPGRADE':
-      return {
+      return createEdgeResult({
         statusCode: 400,
         type: 'invalid_upgrade',
         code: 'REVERSE_PROXY_BAD_UPGRADE',
@@ -242,9 +281,9 @@ const classifyProxyError = (error = createProxyError('REVERSE_PROXY_BAD_GATEWAY'
         resultCategory: 'invalid_request',
         respond: true,
         error: sanitizedError
-      };
+      });
     case 'REVERSE_PROXY_UNSUPPORTED_TARGET':
-      return {
+      return createEdgeResult({
         statusCode: 502,
         type: 'unsupported_target',
         code: 'REVERSE_PROXY_UNSUPPORTED_TARGET',
@@ -252,9 +291,9 @@ const classifyProxyError = (error = createProxyError('REVERSE_PROXY_BAD_GATEWAY'
         resultCategory: 'invalid_target',
         respond: true,
         error: sanitizedError
-      };
+      });
     case 'REVERSE_PROXY_DOWNSTREAM_DISCONNECT':
-      return {
+      return createEdgeResult({
         statusCode: 499,
         type: 'downstream_disconnect',
         code: 'REVERSE_PROXY_DOWNSTREAM_DISCONNECT',
@@ -262,10 +301,10 @@ const classifyProxyError = (error = createProxyError('REVERSE_PROXY_BAD_GATEWAY'
         resultCategory: 'cancelled',
         respond: false,
         error: sanitizedError
-      };
+      });
     default:
       if (NETWORK_FAILURE_CODES.has(error.code) || error.isUpstream) {
-        return {
+        return createEdgeResult({
           statusCode: 502,
           type: 'upstream_unavailable',
           code: 'REVERSE_PROXY_BAD_GATEWAY',
@@ -273,10 +312,10 @@ const classifyProxyError = (error = createProxyError('REVERSE_PROXY_BAD_GATEWAY'
           resultCategory: 'upstream_failure',
           respond: true,
           error: sanitizedError
-        };
+        });
       }
 
-      return {
+      return createEdgeResult({
         statusCode: 500,
         type: 'proxy_error',
         code: 'REVERSE_PROXY_INTERNAL_ERROR',
@@ -284,9 +323,46 @@ const classifyProxyError = (error = createProxyError('REVERSE_PROXY_BAD_GATEWAY'
         resultCategory: 'proxy_error',
         respond: true,
         error: sanitizedError
-      };
+      });
   }
 };
+
+const normalizeRequestIdValue = (headerValue) => {
+  if (Array.isArray(headerValue)) {
+    for (const value of headerValue) {
+      const normalizedValue = normalizeRequestIdValue(value);
+
+      if (normalizedValue) {
+        return normalizedValue;
+      }
+    }
+
+    return null;
+  }
+
+  if (headerValue == null) {
+    return null;
+  }
+
+  const normalizedValue = String(headerValue).replace(/[\r\n]+/g, ' ').trim();
+
+  if (!normalizedValue) {
+    return null;
+  }
+
+  return normalizedValue.slice(0, MAX_REQUEST_ID_LENGTH);
+};
+
+const getRequestIdHeader = (headers, headerName) =>
+  normalizeRequestIdValue(headers?.[headerName]);
+
+const resolveClientRequestId = (headers) =>
+  getRequestIdHeader(headers, CLIENT_REQUEST_ID_HEADER) ??
+  getRequestIdHeader(headers, EDGE_REQUEST_ID_HEADER);
+
+const resolveUpstreamRequestId = (headers) =>
+  getRequestIdHeader(headers, EDGE_REQUEST_ID_HEADER) ??
+  getRequestIdHeader(headers, UPSTREAM_REQUEST_ID_HEADER);
 
 const getForwardedFor = (req) => {
   const currentValue = req.headers?.['x-forwarded-for'];
@@ -325,7 +401,13 @@ const buildForwardHeaders = (req, ctx, { includeUpgradeHeaders = false } = {}) =
 
   forwardedHeaders['x-forwarded-host'] = ctx.originalHost || ctx.routeHost;
   forwardedHeaders['x-forwarded-proto'] = ctx.forwardedProto;
-  forwardedHeaders['x-request-id'] = ctx.requestId;
+  forwardedHeaders[EDGE_REQUEST_ID_HEADER] = ctx.edgeRequestId;
+
+  if (ctx.clientRequestId) {
+    forwardedHeaders[CLIENT_REQUEST_ID_HEADER] = ctx.clientRequestId;
+  } else {
+    delete forwardedHeaders[CLIENT_REQUEST_ID_HEADER];
+  }
 
   if (includeUpgradeHeaders) {
     if (req.headers?.connection) {
@@ -340,8 +422,9 @@ const buildForwardHeaders = (req, ctx, { includeUpgradeHeaders = false } = {}) =
   return forwardedHeaders;
 };
 
-const sanitizeResponseHeaders = (headers, requestId) => {
+const sanitizeResponseHeaders = (headers, edgeRequestId) => {
   const sanitizedHeaders = {};
+  const upstreamRequestId = resolveUpstreamRequestId(headers);
 
   for (const [headerName, headerValue] of Object.entries(headers ?? {})) {
     if (headerValue == null) {
@@ -355,8 +438,16 @@ const sanitizeResponseHeaders = (headers, requestId) => {
     sanitizedHeaders[headerName] = headerValue;
   }
 
-  sanitizedHeaders['x-request-id'] = requestId;
-  return sanitizedHeaders;
+  sanitizedHeaders[EDGE_REQUEST_ID_HEADER] = edgeRequestId;
+
+  if (!sanitizedHeaders[UPSTREAM_REQUEST_ID_HEADER] && upstreamRequestId) {
+    sanitizedHeaders[UPSTREAM_REQUEST_ID_HEADER] = upstreamRequestId;
+  }
+
+  return {
+    responseHeaders: sanitizedHeaders,
+    upstreamRequestId
+  };
 };
 
 const renderErrorBody = (classification, requestId) =>
@@ -415,45 +506,63 @@ const writeUpgradeErrorResponse = (socket, classification, requestId) => {
   socket.end(response);
 };
 
-const resolveTimeouts = (target, routeHost, config) => ({
-  connectTimeoutMs: target?.connectTimeoutMs ?? config.connectTimeoutMs,
-  upstreamTimeoutMs:
-    target?.upstreamTimeoutMs ??
-    (routeHost === CHATGPT_PROXY_HOST
-      ? (config.chatgptProxyTimeoutMs ?? config.upstreamTimeoutMs)
-      : config.upstreamTimeoutMs)
-});
+const resolveTimeouts = (target, routeHost, config) => {
+  const chatgptProxyTimeoutOverrideUsed =
+    Boolean(target) &&
+    routeHost === CHATGPT_PROXY_HOST &&
+    target?.upstreamTimeoutMs === undefined;
 
-const createRequestContext = ({ req, resolution, config, kind }) => ({
-  requestId: randomUUID(),
-  kind,
-  method: req.method ?? 'GET',
-  path: sanitizePath(req.url),
-  originalHost: resolution.originalHost,
-  routeHost: resolution.normalizedHost,
-  target: resolution.target
-    ? {
-      ...resolution.target,
-      protocol: resolution.target.protocol ?? 'http:'
-    }
-    : null,
-  forwardedProto: req.socket?.encrypted ? 'https' : 'http',
-  startTimeMs: Date.now(),
-  timeouts: resolveTimeouts(resolution.target, resolution.normalizedHost, config)
-});
+  return {
+    connectTimeoutMs: target?.connectTimeoutMs ?? config.connectTimeoutMs,
+    upstreamTimeoutMs:
+      target?.upstreamTimeoutMs ??
+      (chatgptProxyTimeoutOverrideUsed
+        ? (config.chatgptProxyTimeoutMs ?? config.upstreamTimeoutMs)
+        : config.upstreamTimeoutMs),
+    inboundTimeoutMs: config.inboundTimeoutMs,
+    chatgptProxyTimeoutOverrideUsed
+  };
+};
+
+const createRequestContext = ({ req, resolution, config, kind }) => {
+  const edgeRequestId = randomUUID();
+
+  return {
+    requestId: edgeRequestId,
+    edgeRequestId,
+    clientRequestId: resolveClientRequestId(req.headers),
+    kind,
+    method: req.method ?? 'GET',
+    path: sanitizePath(req.url),
+    originalHost: resolution.originalHost,
+    routeHost: resolution.normalizedHost,
+    target: resolution.target
+      ? {
+        ...resolution.target,
+        protocol: resolution.target.protocol ?? 'http:'
+      }
+      : null,
+    forwardedProto: req.socket?.encrypted ? 'https' : 'http',
+    startTimeMs: Date.now(),
+    timeouts: resolveTimeouts(resolution.target, resolution.normalizedHost, config)
+  };
+};
 
 const applyDownstreamTimeoutBudget = (req, res, ctx, config) => {
   if (ctx.timeouts.upstreamTimeoutMs <= config.inboundTimeoutMs) {
     return;
   }
 
-  req.setTimeout(ctx.timeouts.upstreamTimeoutMs);
-  res.setTimeout(ctx.timeouts.upstreamTimeoutMs);
+  req.setTimeout(ctx.timeouts.upstreamTimeoutMs, noop);
+  res.setTimeout(ctx.timeouts.upstreamTimeoutMs, noop);
 };
 
 const createLogEntry = (ctx, result, stats) => ({
   timestamp: new Date().toISOString(),
-  requestId: ctx.requestId,
+  requestId: ctx.edgeRequestId,
+  edgeRequestId: ctx.edgeRequestId,
+  clientRequestId: ctx.clientRequestId ?? null,
+  upstreamRequestId: result.upstreamRequestId ?? null,
   kind: ctx.kind,
   host: ctx.originalHost,
   routeHost: ctx.routeHost,
@@ -465,22 +574,48 @@ const createLogEntry = (ctx, result, stats) => ({
   resultCategory: result.resultCategory,
   resultType: result.type,
   message: result.message,
+  statusSource: result.statusSource ?? null,
   statusCode: result.statusCode ?? null,
   proxyStatusCode: result.proxyStatusCode ?? null,
+  upstreamStatusCode: result.upstreamStatusCode ?? null,
   timeoutValues: ctx.timeouts,
   concurrency: stats,
   error: result.error ?? null
 });
+
+const withUpstreamContext = (
+  result,
+  { upstreamRequestId = null, upstreamStatusCode = null } = {}
+) => {
+  if (!upstreamRequestId && upstreamStatusCode == null) {
+    return result;
+  }
+
+  return {
+    ...result,
+    upstreamRequestId: result.upstreamRequestId ?? upstreamRequestId,
+    upstreamStatusCode: result.upstreamStatusCode ?? upstreamStatusCode
+  };
+};
 
 const withObservedStatus = (result, observedStatusCode) => {
   if (observedStatusCode == null || result.statusCode === observedStatusCode) {
     return result;
   }
 
+  if (result.statusSource === 'edge') {
+    return {
+      ...result,
+      statusCode: observedStatusCode,
+      proxyStatusCode: result.proxyStatusCode ?? result.statusCode,
+      upstreamStatusCode: result.upstreamStatusCode ?? observedStatusCode
+    };
+  }
+
   return {
     ...result,
-    proxyStatusCode: result.statusCode,
-    statusCode: observedStatusCode
+    statusCode: observedStatusCode,
+    upstreamStatusCode: observedStatusCode
   };
 };
 
@@ -573,6 +708,7 @@ const createProxyRequestHandler = ({
             timeoutValues: {
               inboundTimeoutMs: config.inboundTimeoutMs,
               upstreamTimeoutMs: config.upstreamTimeoutMs,
+              chatgptProxyTimeoutMs: config.chatgptProxyTimeoutMs ?? config.upstreamTimeoutMs,
               connectTimeoutMs: config.connectTimeoutMs
             }
           };
@@ -619,6 +755,7 @@ const createProxyRequestHandler = ({
     }
 
     let observedStatusCode = null;
+    let observedUpstreamRequestId = null;
     let upstreamReq;
     let upstreamRes;
     const cleanupFns = [() => lease.release()];
@@ -662,7 +799,10 @@ const createProxyRequestHandler = ({
     };
 
     const failRequest = (error) => {
-      const result = classifyProxyError(error);
+      const result = withUpstreamContext(classifyProxyError(error), {
+        upstreamRequestId: observedUpstreamRequestId,
+        upstreamStatusCode: observedStatusCode
+      });
       stopUpstream(error);
 
       if (result.respond) {
@@ -699,7 +839,11 @@ const createProxyRequestHandler = ({
       }
     });
     addListener(cleanupFns, res, 'finish', () => {
-      finalize(createCompletionResult(observedStatusCode ?? 200));
+      finalize(
+        createCompletionResult(observedStatusCode ?? 200, {
+          upstreamRequestId: observedUpstreamRequestId
+        })
+      );
     });
 
     const upstream = createUpstreamRequest({
@@ -716,13 +860,14 @@ const createProxyRequestHandler = ({
       upstreamRes = incomingResponse;
       observedStatusCode = incomingResponse.statusCode ?? 502;
 
-      const responseHeaders = sanitizeResponseHeaders(
+      const sanitizedResponse = sanitizeResponseHeaders(
         incomingResponse.headers,
-        ctx.requestId
+        ctx.edgeRequestId
       );
+      observedUpstreamRequestId = sanitizedResponse.upstreamRequestId;
 
       if (!res.headersSent) {
-        res.writeHead(observedStatusCode, responseHeaders);
+        res.writeHead(observedStatusCode, sanitizedResponse.responseHeaders);
       }
 
       addListener(cleanupFns, incomingResponse, 'error', (error) => {
@@ -968,7 +1113,7 @@ const createUpgradeProxyHandler = ({
         socket.end();
       }
 
-      finalize(createCompletionResult(observedStatusCode, 'upgrade'));
+      finalize(createCompletionResult(observedStatusCode, { kind: 'upgrade' }));
     });
 
     const connectEvent = ctx.target.protocol === 'https:' ? 'secureConnect' : 'connect';

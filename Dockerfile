@@ -10,7 +10,8 @@ COPY package*.json ./
 # Install production dependencies
 RUN npm ci --omit=dev
 
-# Copy only the runtime application code; certificates are mounted at runtime
+# Copy runtime application code and static host routing config; certificates are mounted at runtime
+COPY hosts.json ./
 COPY src ./src
 
 # Expose the port on which the server will listen

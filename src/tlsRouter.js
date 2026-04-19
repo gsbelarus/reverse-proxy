@@ -1,7 +1,7 @@
 const net = require('net');
 const { randomUUID } = require('crypto');
 
-const { normalizeHost } = require('./config');
+const { getHostMap, normalizeHost } = require('./config');
 const { classifyProxyError, createProxyError } = require('./reverseProxy');
 
 const TLS_RECORD_HEADER_LENGTH = 5;
@@ -208,7 +208,7 @@ const isPassthroughTarget = (target) => target?.mode === TLS_PASSTHROUGH_MODE;
 
 const getPassthroughTarget = (hosts, serverName) => {
   const normalizedHost = normalizeHost(serverName);
-  const target = hosts?.[normalizedHost] ?? null;
+  const target = getHostMap(hosts)[normalizedHost] ?? null;
 
   if (!isPassthroughTarget(target)) {
     return null;
