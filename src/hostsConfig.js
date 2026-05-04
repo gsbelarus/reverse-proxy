@@ -16,6 +16,7 @@ const ALLOWED_TARGET_KEYS = new Set([
   'mode',
   'port',
   'protocol',
+  'upstreamHost',
   'upstreamTimeoutMs'
 ]);
 
@@ -87,6 +88,18 @@ const normalizeHostTarget = (hostname, target) => {
     }
 
     normalizedTarget.protocol = protocol;
+
+    if (target.upstreamHost !== undefined) {
+      const upstreamHost = String(target.upstreamHost).trim();
+
+      if (!upstreamHost) {
+        throw new Error(`Target upstreamHost for ${hostname} must not be empty`);
+      }
+
+      normalizedTarget.upstreamHost = upstreamHost;
+    }
+  } else if (target.upstreamHost !== undefined) {
+    throw new Error(`Target upstreamHost for ${hostname} is only supported for http-proxy mode`);
   }
 
   if (target.connectTimeoutMs !== undefined) {

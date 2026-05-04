@@ -95,6 +95,24 @@ const sanitizeError = (error) => {
   };
 };
 
+const formatHostHeader = (hostname, port, protocol) => {
+  const defaultPort = protocol === 'https:' ? 443 : 80;
+  const normalizedHost = hostname.includes(':') && !hostname.startsWith('[')
+    ? `[${hostname}]`
+    : hostname;
+
+  if (port === defaultPort) {
+    return normalizedHost;
+  }
+
+  return `${normalizedHost}:${port}`;
+};
+
+const resolveUpstreamHostOverride = (target) => {
+  const upstreamHost = String(target?.upstreamHost ?? '').trim();
+  return upstreamHost || null;
+};
+
 const createLogStore = ({ maxEntries = 500 } = {}) => {
   const entries = [];
 
@@ -409,6 +427,15 @@ const buildForwardHeaders = (req, ctx, { includeUpgradeHeaders = false } = {}) =
     delete forwardedHeaders[CLIENT_REQUEST_ID_HEADER];
   }
 
+  const upstreamHostOverride = resolveUpstreamHostOverride(ctx.target);
+  if (upstreamHostOverride) {
+    forwardedHeaders.host = formatHostHeader(
+      upstreamHostOverride,
+      ctx.target.port,
+      ctx.target.protocol
+    );
+  }
+
   if (includeUpgradeHeaders) {
     if (req.headers?.connection) {
       forwardedHeaders.connection = req.headers.connection;
@@ -624,13 +651,15 @@ const defaultClientFactory = (target) =>
 
 const createUpstreamRequest = ({ req, ctx, headers, clientFactory = defaultClientFactory }) => {
   const transport = clientFactory(ctx.target);
+  const upstreamHostOverride = resolveUpstreamHostOverride(ctx.target);
   const upstreamReq = transport.request({
     protocol: ctx.target.protocol,
     host: ctx.target.host,
     port: ctx.target.port,
     path: req.url,
     method: req.method,
-    headers
+    headers,
+    ...(upstreamHostOverride ? { servername: upstreamHostOverride } : {})
   });
 
   const connectTimer = setTimeout(() => {
@@ -934,7 +963,7 @@ const defaultUpgradeSocketFactory = (target) =>
     ? tls.connect({
       host: target.host,
       port: target.port,
-      servername: target.host
+      servername: resolveUpstreamHostOverride(target) ?? target.host
     })
     : net.connect({
       host: target.host,

@@ -50,6 +50,11 @@
           ],
           "description": "Upstream protocol used by http-proxy targets."
         },
+        "upstreamHost": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Optional hostname used for the upstream Host header and HTTPS SNI when proxying through a different connect address."
+        },
         "connectTimeoutMs": {
           "type": "integer",
           "minimum": 1,

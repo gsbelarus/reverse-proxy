@@ -36,6 +36,7 @@ The proxy does not hardcode its public host list anymore. It loads routes from `
 - Host keys must already be normalized: lowercase, no port, and no leading `www.`.
 - `mode` defaults to `http-proxy`.
 - `protocol` is used for `http-proxy` targets and may be `http:` or `https:`.
+- `upstreamHost` is optional for `http-proxy` targets. When set, the proxy sends that hostname as the upstream `Host` header and, for `protocol: "https:"`, as the upstream TLS SNI name.
 - `ws:` and `wss:` are not config values. WebSocket upgrades still use `mode: "http-proxy"`; `protocol: "http:"` means plain WebSocket to the upstream, while `protocol: "https:"` means TLS-secured WebSocket to the upstream.
 - `tls-passthrough` targets are routed as raw TLS on port `443` and are excluded from TLS termination and ACME issuance.
 - Optional per-target overrides: `connectTimeoutMs`, `upstreamTimeoutMs`.
@@ -61,6 +62,13 @@ Example `hosts.json`:
 		"host": "localhost",
 		"port": 3030,
 		"protocol": "http:",
+		"mode": "http-proxy"
+	},
+	"api.example.com": {
+		"host": "203.0.113.10",
+		"port": 443,
+		"protocol": "https:",
+		"upstreamHost": "origin.example.net",
 		"mode": "http-proxy"
 	},
 	"webrtc-turns.gdmn.app": {
@@ -181,7 +189,7 @@ Proxy-generated errors are returned as JSON in this shape:
 ## Forwarding Behavior
 
 - Request method and path are preserved
-- Original `Host` is preserved
+- Original `Host` is preserved unless the route defines `upstreamHost`; in that case the proxy forwards `Host: upstreamHost` (including a non-default port when needed)
 - The reverse proxy always generates its own edge `x-request-id`
 - Incoming caller `x-request-id` is preserved as `x-client-request-id` when present and forwarded upstream alongside the edge ID
 - `x-forwarded-for`, `x-forwarded-host`, and `x-forwarded-proto` are added explicitly
@@ -201,7 +209,7 @@ Proxy-generated errors are returned as JSON in this shape:
 
 The proxy now handles HTTP `Upgrade` requests, including WebSocket-style handshakes, by tunneling them to mapped upstreams with the same connect timeout, idle timeout, logging, and cancellation rules.
 
-Public `wss://` works through the HTTPS listener on port `443` for `http-proxy` targets. If the target uses `protocol: "http:"`, the proxy forwards that upgraded connection to the upstream without TLS; if the target uses `protocol: "https:"`, the proxy connects to the upstream over TLS. Public `ws://` on port `80` is not proxied, because port `80` is reserved for HTTP-to-HTTPS redirect traffic and ACME HTTP-01 challenge handling.
+Public `wss://` works through the HTTPS listener on port `443` for `http-proxy` targets. If the target uses `protocol: "http:"`, the proxy forwards that upgraded connection to the upstream without TLS; if the target uses `protocol: "https:"`, the proxy connects to the upstream over TLS and uses `upstreamHost` as the SNI name when configured, otherwise `host`. Public `ws://` on port `80` is not proxied, because port `80` is reserved for HTTP-to-HTTPS redirect traffic and ACME HTTP-01 challenge handling.
 
 ## TURN/TLS Support
 

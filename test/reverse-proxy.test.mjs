@@ -170,17 +170,29 @@ const createConfig = (overrides = {}) => ({
   ...overrides
 });
 
-const createProxyFixture = ({ hosts, config = createConfig() }) => {
+const createProxyFixture = ({
+  hosts,
+  config = createConfig(),
+  clientFactory,
+  socketFactory
+}) => {
   const tracker = createRequestTracker({
     maxParallelRequests: config.maxParallelRequests
   });
   const logStore = createLogStore({ maxEntries: config.logBufferLength });
-  const handler = createProxyRequestHandler({ hosts, config, tracker, logStore });
+  const handler = createProxyRequestHandler({
+    hosts,
+    config,
+    tracker,
+    logStore,
+    ...(clientFactory ? { clientFactory } : {})
+  });
   const upgradeHandler = createUpgradeProxyHandler({
     hosts,
     config,
     tracker,
-    logStore
+    logStore,
+    ...(socketFactory ? { socketFactory } : {})
   });
   const server = http.createServer(handler);
   server.on('upgrade', upgradeHandler);
@@ -368,7 +380,8 @@ test('hosts config loads external host mappings from json', (t) => {
     'api.example.com': {
       host: '127.0.0.1',
       port: 3001,
-      protocol: 'https:'
+      protocol: 'https:',
+      upstreamHost: 'origin.example.net'
     },
     'turn.example.com': {
       host: '127.0.0.1',
@@ -384,6 +397,7 @@ test('hosts config loads external host mappings from json', (t) => {
       host: '127.0.0.1',
       port: 3001,
       protocol: 'https:',
+      upstreamHost: 'origin.example.net',
       mode: 'http-proxy'
     },
     'turn.example.com': {
@@ -1347,6 +1361,61 @@ test('forwarded headers include both client and edge request ids', async (t) => 
   assert.ok(forwardedHeaders['x-request-id']);
   assert.notEqual(forwardedHeaders['x-request-id'], clientRequestId);
   assert.equal(response.headers['x-request-id'], forwardedHeaders['x-request-id']);
+});
+
+test('http-proxy upstreamHost overrides forwarded host header and https servername', async (t) => {
+  let capturedHostHeader = null;
+  let capturedServername = null;
+
+  const upstreamServer = https.createServer(
+    {
+      key: TEST_TLS_KEY,
+      cert: TEST_TLS_CERT
+    },
+    (req, res) => {
+      capturedHostHeader = req.headers.host;
+      res.writeHead(204);
+      res.end();
+    }
+  );
+  upstreamServer.on('secureConnection', (socket) => {
+    capturedServername = socket.servername ?? null;
+  });
+  const upstreamPort = await listen(upstreamServer);
+  t.after(() => closeServer(upstreamServer));
+
+  const fixture = createProxyFixture({
+    hosts: {
+      '1c-mcp.gdmn.app': {
+        host: '127.0.0.1',
+        port: upstreamPort,
+        protocol: 'https:',
+        upstreamHost: '1cider.ru'
+      }
+    },
+    clientFactory: () => ({
+      request(options) {
+        return https.request({
+          ...options,
+          agent: false,
+          rejectUnauthorized: false
+        });
+      }
+    })
+  });
+
+  const proxyPort = await listen(fixture.server);
+  t.after(() => closeServer(fixture.server));
+
+  const response = await requestProxy({
+    port: proxyPort,
+    hostHeader: '1c-mcp.gdmn.app',
+    path: '/mcp'
+  });
+
+  assert.equal(response.statusCode, 204);
+  assert.equal(capturedServername, '1cider.ru');
+  assert.equal(capturedHostHeader, `1cider.ru:${upstreamPort}`);
 });
 
 test('upstream request ids and upstream http failures are surfaced in responses and logs', async (t) => {
